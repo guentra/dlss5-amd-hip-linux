@@ -42,7 +42,7 @@ struct IUnknown {virtual HRESULT QueryInterface(REFIID id,void**p){if(id==IID_IU
 inline std::atomic<int> objects{0}, maps{0}, key_samples{0}, runs{0}, clients{0};
 inline std::atomic<bool> key_down{false},fail_hip{false},block_run{false},entered_run{false};
 inline bool fail_map=false,fail_private=false,accept_marker=true,fail_shared=false;inline int fail_create=0,creates=0;
-inline bool srgb=false;inline int last_seed=-1;inline std::string matched_adapter;
+inline bool srgb=false;inline int last_seed=-1;inline unsigned last_temporal_gen=0;inline std::string matched_adapter;
 inline void(*desc_hook)()=nullptr;
 inline std::atomic<bool> init_entered{false},block_init{false};
 inline short GetAsyncKeyState(int){++key_samples;return key_down?short(0x8000):0;}
@@ -95,8 +95,8 @@ class NativeHipClient{public:NativeHipClient(){++clients;}~NativeHipClient(){--c
 void Create(const char*n){matched_adapter=n;init_entered=true;while(block_init)std::this_thread::yield();}
 bool Ready()const{return true;}
 bool HasRawGpu()const{return true;}
-int RunFrameRaw(void*in,void*out,unsigned w,unsigned h,unsigned dxgi,unsigned seed,bool display,bool host_ptrs,unsigned gen){
-(void)in;(void)host_ptrs;(void)gen;++runs;last_seed=int(seed);assert(display==srgb);
+int RunFrameRaw(void*in,void*out,unsigned w,unsigned h,unsigned dxgi,unsigned seed,bool display,bool host_ptrs,unsigned gen,unsigned temporal_gen){
+(void)in;(void)host_ptrs;(void)gen;last_temporal_gen=temporal_gen;++runs;last_seed=int(seed);assert(display==srgb);
 entered_run=true;while(block_run)std::this_thread::yield();
 if(fail_hip)return -1;
 unsigned bpp=(dxgi==10||dxgi==11)?8:4;
@@ -167,6 +167,35 @@ assert(objects==0);
 int before=key_samples;key_down=true;assert(!record(live,f));assert(!record(live,f));
 assert(key_samples==before+2);key_down=false;assert(!record(live,f));
 key_down=true;assert(record(live,f,100));assert(f.l->Run(100)==0);assert(last_seed==100);}
+assert(objects==0&&clients==0);
+''')
+
+    def test_temporal_generation_reaches_the_bridge_and_tracks_f6(self):
+        """temporal_gen must actually be forwarded, and must change on bypass.
+
+        The bridge resets its temporal blend whenever this token changes, so
+        that a network frame is never mixed with a pre-bypass previous frame.
+        A caller that forwards a constant - or drops the argument - produces no
+        error anywhere: frames keep rendering and the blend is simply wrong
+        across an F6 toggle. This pins it to the bypass generation instead."""
+        run_cpp(r'''
+{Fixture f;NativeHipLive live;ready(live,f);
+assert(f.l->Run()==0&&runs==1);
+const unsigned first=last_temporal_gen;
+// Two toggles: bypass (odd generation), then enabled again (even, and
+// different from where it started).
+// Toggle through the null-list form, which only samples the key: it
+// creates no job and so cannot leave one anchored.
+key_down=true;live.Record(nullptr,nullptr,0,20);key_down=false;live.Record(nullptr,nullptr,0,21);
+key_down=true;live.Record(nullptr,nullptr,0,22);key_down=false;
+f.l->ResetAllocator();
+bool ran=false;
+for(int i=0;i<2000&&!ran;i++){
+ record(live,f,uint64_t(30+i));
+ if(f.l->marker.context){assert(f.l->Run()==0);ran=runs==2;}
+ f.l->ResetAllocator();
+}
+assert(ran);assert(last_temporal_gen!=first);}
 assert(objects==0&&clients==0);
 ''')
 
