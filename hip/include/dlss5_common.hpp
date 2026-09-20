@@ -146,7 +146,7 @@ __host__ __device__ inline u8 e4m3_byte(float v) {
     // a cndmask (no divergent branch); production values are finite so the select is
     // uniform. This drops the old finiteness branch + the dead software path per call.
     u32 bits = as_u32(v);
-    u8 hw = u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false) & 0xffu);
+    u8 hw = u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false));
     return ((bits & 0x7fffffffu) > 0x7f800000u) ? u8(0x7f | (bits & 0x80u)) : hw;
 #else
     u32 b = as_u32(v), a = b & 0x7fffffffu;
@@ -160,6 +160,20 @@ __host__ __device__ inline u8 e4m3_byte(float v) {
     u32 rounded = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
     u32 code = ((rounded >> 23) - 120u) * 8u + ((rounded >> 20) & 7u);
     return u8(sg | (code > 126u ? 126u : code));
+#endif
+}
+
+// Fast E4M3 for verified-finite operands: drops the defensive NaN-sign select of
+// e4m3_byte (4 instructions/call). Bit-identical to e4m3_byte for every finite
+// input (same fmed3f clamp + cvt_pk_fp8_f32, verified in test_e4m3_hw.hip); on
+// NaN input it returns the hardware NaN code 0x7f instead of 0x7f|sign. Use only
+// where all production operands are finite (C32/ViT paths, covered by
+// test_graph_vit + test_raw_pipeline).
+__host__ __device__ inline u8 e4m3_byte_fast(float v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false));
+#else
+    return e4m3_byte(v);
 #endif
 }
 

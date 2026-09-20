@@ -66,10 +66,10 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it]) = hp[0];
         *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it] + 2u) = hp[1];
         *reinterpret_cast<u32*>(packed + tok[it] * 36u + c4s[it]) =
-            u32(e4m3_byte(__half2float(__low2half(hp[0])))) |
-            u32(e4m3_byte(__half2float(__high2half(hp[0])))) << 8 |
-            u32(e4m3_byte(__half2float(__low2half(hp[1])))) << 16 |
-            u32(e4m3_byte(__half2float(__high2half(hp[1])))) << 24;
+            u32(e4m3_byte_fast(__half2float(__low2half(hp[0])))) |
+            u32(e4m3_byte_fast(__half2float(__high2half(hp[0])))) << 8 |
+            u32(e4m3_byte_fast(__half2float(__low2half(hp[1])))) << 16 |
+            u32(e4m3_byte_fast(__half2float(__high2half(hp[1])))) << 24;
     }
     c32_sync_window();
 
@@ -86,7 +86,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
 #pragma unroll
             for (uint i = 0; i < 8u; ++i)
                 hidden[(first + grow + i) * HIDDEN_STRIDE + hcol] =
-                    e4m3_byte(ActivatePolyC32(ex.Get(i)));
+                    e4m3_byte_fast(ActivatePolyC32(ex.Get(i)));
         }
     }
     c32_sync_window();
@@ -98,8 +98,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         float iv0 = __half2float(in16[(first + rc2.x) * 34u + rc2.y]);
         float iv1 = __half2float(in16[(first + rc2.x) * 34u + 16u + rc2.y]);
         if constexpr (CHAIN) {
-            iv0 = from_e4m3(e4m3_byte(iv0));
-            iv1 = from_e4m3(e4m3_byte(iv1));
+            iv0 = from_e4m3(e4m3_byte_fast(iv0));
+            iv1 = from_e4m3(e4m3_byte_fast(iv1));
         }
         acc0.Set(i, iv0 * fs0);
         acc1.Set(i, iv1 * fs1);
@@ -120,12 +120,12 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         uint2 rc2 = acc0.GetCoordinate(i);
         uint row = first + rc2.x;
         saved0[i] = __float2half_rn(acc0.Get(i));
-        ffn8[row * 36u + rc2.y] = e4m3_byte(__half2float(saved0[i]));
+        ffn8[row * 36u + rc2.y] = e4m3_byte_fast(__half2float(saved0[i]));
         if constexpr (WRITE_FFN)
             ffn_h[(window * 64u + row) * 32u + rc2.y] = saved0[i];
         uint2 rc3 = acc1.GetCoordinate(i);
         saved1[i] = __float2half_rn(acc1.Get(i));
-        ffn8[row * 36u + 16u + rc3.y] = e4m3_byte(__half2float(saved1[i]));
+        ffn8[row * 36u + 16u + rc3.y] = e4m3_byte_fast(__half2float(saved1[i]));
         if constexpr (WRITE_FFN)
             ffn_h[(window * 64u + row) * 32u + 16u + rc3.y] = saved1[i];
     }
@@ -177,14 +177,14 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                     inv *= q0s;
                 u8* dst = packed + (part * 64u + row) * 36u;
                 for (uint ch = 0; ch < 32u; ++ch)
-                    dst[ch] = e4m3_byte(s0[ch] * inv);
+                    dst[ch] = e4m3_byte_fast(s0[ch] * inv);
             }
         } else {
             for (uint col = 0; col < 32u; col += 16u)
                 for (uint e = 0; e < 8u; ++e) {
                     const uint row = first + gr * 8u + e;
                     const uint c = col + rc;
-                    packed[(128u + row) * 36u + c] = e4m3_byte(raw[row * RAW_STRIDE + part * 32u + c]);
+                    packed[(128u + row) * 36u + c] = e4m3_byte_fast(raw[row * RAW_STRIDE + part * 32u + c]);
                 }
         }
         c32_sync_window();
@@ -229,7 +229,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             u8* b = reinterpret_cast<u8*>(&v);
 #pragma unroll
             for (uint t = 0; t < 16u; ++t)
-                b[t] = e4m3_byte(__half2float(scores[qi * 68u + q4 * 16u + t]) * inv);
+                b[t] = e4m3_byte_fast(__half2float(scores[qi * 68u + q4 * 16u + t]) * inv);
             p8r[q4] = v;
         }
     }
@@ -256,9 +256,9 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         }
         for (uint i = 0; i < rav0.Length(); ++i) {
             uint2 rc2 = rav0.GetCoordinate(i);
-            packed[(first + rc2.x) * 36u + rc2.y] = e4m3_byte(rav0.Get(i));
+            packed[(first + rc2.x) * 36u + rc2.y] = e4m3_byte_fast(rav0.Get(i));
             uint2 rc3 = rav1.GetCoordinate(i);
-            packed[(first + rc3.x) * 36u + 16u + rc3.y] = e4m3_byte(rav1.Get(i));
+            packed[(first + rc3.x) * 36u + 16u + rc3.y] = e4m3_byte_fast(rav1.Get(i));
         }
     }
     c32_sync_window();
