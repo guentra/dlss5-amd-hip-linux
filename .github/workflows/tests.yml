@@ -1,0 +1,68 @@
+name: tests
+
+# The host-testable part of the suite runs without a GPU: it compiles the real
+# headers natively and exercises them directly, so a plain runner still covers
+# pixel conversion, the live hook's callback logic, ABI layout and the
+# install/packaging code. Tests that genuinely need hardware or
+# non-redistributable files (a ROCm GPU, an llvm-mingw toolchain, NVIDIA's
+# nvngx_dlssnr.dll) skip themselves rather than fail - the "report skips" step
+# prints exactly which, so a silent loss of coverage stays visible.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The trampoline import-table test needs a mingw cross-compiler; without
+      # one it skips, which would quietly drop the check that dlss5_hip.dll
+      # stays loadable with nothing beside it.
+      # mingw-w64 for the trampoline tests, llvm for the disassembly one.
+      # Without either they skip themselves, which is exactly the silent loss
+      # of coverage this workflow exists to prevent.
+      - name: Install mingw-w64 and llvm
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 llvm
+
+      - name: Toolchain versions
+        run: |
+          c++ --version
+          python3 --version
+          x86_64-w64-mingw32-gcc --version
+          ls /usr/bin/llvm-readobj* /usr/bin/llvm-objdump*
+
+      # Run from hip/ against ../linux/tests, matching hip/Makefile's own
+      # test-python target rather than inventing a second way to invoke it.
+      - name: Run host test suite
+        working-directory: hip
+        run: python3 -m unittest discover -s ../linux/tests -v 2>&1 | tee ../test-output.txt
+
+      - name: Report skips
+        if: always()
+        run: |
+          echo '## Skipped tests' >> "$GITHUB_STEP_SUMMARY"
+          if grep -q 'skipped' test-output.txt; then
+            grep -o "skipped '[^']*'" test-output.txt | sort | uniq -c \
+              | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'None - every test ran.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.txt
