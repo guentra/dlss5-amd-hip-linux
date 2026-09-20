@@ -15,6 +15,12 @@ LOADER_GAME = 'd3d12.dll'
 LOADER_MAGPIE = 'dxgi.dll'
 
 
+class DerivedLayoutsConsentRequired(RuntimeError):
+    """The weights use the experimental reconstructed layout and the user has not
+    consented yet. An interactive caller may offer to reuse them instead of failing;
+    a non-interactive caller must pass --allow-derived-layouts explicitly."""
+
+
 def _safe_file(path: Path) -> Path:
     path = path.expanduser()
     if path.is_symlink() or not path.is_file():
@@ -107,7 +113,7 @@ def find_weights(path: Path, *, allow_derived_layouts=False, progress=None) -> P
             raise RuntimeError(f'Unsafe symlink in weights path: {parent}')
     if root.is_file() and root.name.lower() == 'nvngx_dlssnr.dll':
         if not allow_derived_layouts:
-            raise RuntimeError('Conversion requires --allow-derived-layouts (experimental, not NVIDIA equivalence)')
+            raise DerivedLayoutsConsentRequired('Conversion requires --allow-derived-layouts (experimental, not NVIDIA equivalence)')
         from .convert_dll import convert_nvidia_dll
         return convert_nvidia_dll(root, layout_mode='amd-consumer-derived', progress=progress)
     if root.is_symlink() or not root.is_dir():
@@ -135,7 +141,7 @@ def find_weights(path: Path, *, allow_derived_layouts=False, progress=None) -> P
                     manifest = json.loads(_safe_file(manifest_path).read_text())
                     mode = manifest.get('layout_mode')
                     if mode == 'amd-consumer-derived' and not allow_derived_layouts:
-                        raise RuntimeError('Reconstructed cache requires --allow-derived-layouts')
+                        raise DerivedLayoutsConsentRequired('Reconstructed cache requires --allow-derived-layouts')
                     from .convert_dll import validate_cache
                     # The converter validates an exact expected filename set
                     # before reading entries; never dereference manifest paths.

@@ -1,4 +1,5 @@
 """Explicit converter consent and read-only HIP input inspection."""
+import builtins
 import io
 import json
 from pathlib import Path
@@ -71,6 +72,46 @@ class WeightSelectionTests(unittest.TestCase):
             self.assertTrue(info['conversion_required'])
             self.assertFalse(info['runtime_ready'])
             self.assertEqual(sorted(Path(tmp).iterdir()), [source])
+
+    class _Args:
+        def __init__(self):
+            self.allow_derived_layouts = False
+            self.magpie = False
+
+    def test_interactive_consent_offers_to_reuse_extracted_weights(self):
+        args = self._Args()
+        calls = []
+        def fake_inspect(weights_root, *, allow_derived_layouts):
+            calls.append(allow_derived_layouts)
+            if not allow_derived_layouts:
+                raise package.DerivedLayoutsConsentRequired('Reconstructed cache requires --allow-derived-layouts')
+            return {'root': str(weights_root), 'conversion_required': False, 'runtime_ready': True,
+                    'layout_mode': 'amd-consumer-derived'}
+        with patch.object(package, 'inspect_weights', side_effect=fake_inspect), \
+             patch.object(builtins, 'input', return_value='y'):
+            info = cli.inspect_weights_consent(args, Path('/tmp/w'), interactive=True)
+        self.assertEqual(calls, [False, True], 'consent must retry inspection with the flag')
+        self.assertTrue(args.allow_derived_layouts, 'consent must be remembered for the install')
+        self.assertEqual(info['layout_mode'], 'amd-consumer-derived')
+
+    def test_interactive_consent_decline_aborts_with_flag_hint(self):
+        def fake_inspect(weights_root, *, allow_derived_layouts):
+            if not allow_derived_layouts:
+                raise package.DerivedLayoutsConsentRequired('Reconstructed cache requires --allow-derived-layouts')
+            return {}
+        with patch.object(package, 'inspect_weights', side_effect=fake_inspect), \
+             patch.object(builtins, 'input', return_value='n'), \
+             self.assertRaisesRegex(RuntimeError, 'allow-derived-layouts'):
+            cli.inspect_weights_consent(self._Args(), Path('/tmp/w'), interactive=True)
+
+    def test_non_interactive_consent_still_requires_flag(self):
+        def fake_inspect(weights_root, *, allow_derived_layouts):
+            if not allow_derived_layouts:
+                raise package.DerivedLayoutsConsentRequired('Reconstructed cache requires --allow-derived-layouts')
+            return {}
+        with patch.object(package, 'inspect_weights', side_effect=fake_inspect):
+            with self.assertRaises(package.DerivedLayoutsConsentRequired):
+                cli.inspect_weights_consent(self._Args(), Path('/tmp/w'), interactive=False)
 
     def test_cli_doctor_and_dry_run_are_read_only_for_dll(self):
         with tempfile.TemporaryDirectory() as tmp:

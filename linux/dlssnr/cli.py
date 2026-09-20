@@ -291,6 +291,25 @@ def resolve_weights(args, exe, interactive):
     raise RuntimeError('Specify --weights / --nvidia-dll / --package, or place the weights beside the game executable.')
 
 
+def inspect_weights_consent(args, weights_root, interactive):
+    """Inspect the weights, offering interactive consent for the experimental
+    reconstructed layout instead of demanding --allow-derived-layouts up front."""
+    try:
+        return dict(package.inspect_weights(weights_root, allow_derived_layouts=args.allow_derived_layouts),
+                    mode='magpie' if args.magpie else 'game', hip=True)
+    except package.DerivedLayoutsConsentRequired as exc:
+        if not interactive:
+            raise
+        print(str(exc))
+        require(False, interactive,
+                'Reuse the already extracted weights (experimental reconstructed layout, '
+                'not NVIDIA equivalent)?',
+                '--allow-derived-layouts')
+        args.allow_derived_layouts = True
+        return dict(package.inspect_weights(weights_root, allow_derived_layouts=True),
+                    mode='magpie' if args.magpie else 'game', hip=True)
+
+
 def build_warnings(info, weights_root, exe):
     warnings = [
         'Bundled ReShade add-on loader is copied as d3d12.dll (or dxgi.dll for Magpie).',
@@ -465,8 +484,7 @@ def main(argv=None):
             raise RuntimeError('Anti-cheat detected: refusing installation, no bypass. ' + ', '.join(evidence['anti_cheat_evidence']))
         proton = resolve_proton(args, interactive)
         weights_root = resolve_weights(args, exe, interactive)
-        info = dict(package.inspect_weights(weights_root, allow_derived_layouts=args.allow_derived_layouts),
-                    mode='magpie' if args.magpie else 'game', hip=True)
+        info = inspect_weights_consent(args, weights_root, interactive)
         warnings = build_warnings(info, weights_root, exe)
         foreign = deploy.foreign_deployment(exe)
         if foreign is not None:
