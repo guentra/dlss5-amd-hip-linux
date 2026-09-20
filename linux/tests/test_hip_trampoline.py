@@ -80,9 +80,10 @@ class TrampolineTests(unittest.TestCase):
         """The trampoline must load with nothing but the game beside it.
 
         Built by a GCC-flavoured mingw (Debian/Ubuntu's gcc-mingw-w64-x86-64,
-        what hip/Makefile's discovery finds when no llvm-mingw drop is
-        installed) the default link pulls in libgcc_s_seh-1.dll, which the
-        game's directory does not have. LoadLibrary then fails and the add-on
+        Fedora's mingw-w64-gcc, what hip/Makefile's discovery finds when no
+        llvm-mingw drop is installed) the default link pulls in
+        libgcc_s_seh-1.dll and libwinpthread-1.dll, which the game's
+        directory does not have. LoadLibrary then fails and the add-on
         reports "dlss5_hip.dll missing (HIP trampoline)" - indistinguishable
         from the file being absent, while it sits right there. Found by
         deploying such a build and watching every frame fall back to the
@@ -95,11 +96,19 @@ class TrampolineTests(unittest.TestCase):
             self.skipTest('no objdump available to read the import table')
         with tempfile.TemporaryDirectory() as tmp:
             dll = pathlib.Path(tmp) / 'dlss5_hip.dll'
-            build = subprocess.run([str(gcc), '-shared', '-O2', '-static-libgcc',
+            # -static matches hip/Makefile exactly: on some distros
+            # (Fedora's mingw-w64-gcc) -static-libgcc alone still imports
+            # libwinpthread-1.dll, so the test must verify the real shipped
+            # link line, not a weaker variant of it.
+            build = subprocess.run([str(gcc), '-shared', '-O2', '-static',
                                     '-o', str(dll), str(ROOT / 'hip' / 'src' / 'trampoline.c')],
                                    text=True, capture_output=True)
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            dump = subprocess.run([str(objdump), '-p', str(dll)], text=True, capture_output=True)
+            # Pin the locale: a French-locale binutils objdump prints
+            # "Nom de la DLL" instead of "DLL Name", which breaks the parse.
+            dump = subprocess.run([str(objdump), '-p', str(dll)], text=True,
+                                  capture_output=True,
+                                  env=dict(os.environ, LC_ALL='C'))
             self.assertEqual(dump.returncode, 0, dump.stderr)
             imports = re.findall(r'DLL Name:\s*(\S+)', dump.stdout)
             self.assertTrue(imports, dump.stdout)
