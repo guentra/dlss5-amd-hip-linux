@@ -127,6 +127,14 @@ libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/ke
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h
 	@test -n "$(MINGW_CC)" || { printf '%s\n' 'x86_64-w64-mingw32-gcc not found. Set MINGW_CC= or MINGW_PREFIX= or install mingw-w64.'; exit 2; }
+	# -static: a GCC-flavoured mingw (Debian/Ubuntu's gcc-mingw-w64-x86-64,
+	# which is what the discovery above finds when no llvm-mingw drop is
+	# installed) links this against libgcc_s_seh-1.dll. That file is not in
+	# the game's directory, so LoadLibrary fails and the add-on reports the
+	# trampoline as MISSING - which reads as "the file is absent" while it
+	# sits right there next to the caller. -static pulls in libgcc,
+	# libwinpthread and libstdc++ all at once; llvm-mingw needs no such flag
+	# and is unaffected by it.
 	$(MINGW_CC) -shared -O2 -static -o $@ src/trampoline.c
 
 test: $(TESTS)
