@@ -122,7 +122,8 @@ struct Block {
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.
   void window(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
-              const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true){
+              const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true,
+              bool raster_f16=true){
     uint n=sw*sh;float* f=s.b.as<float>();
       unsigned char* dbg_hidden=nullptr;
       {const char* ds1=getenv("DLSS5_DUMP_SCRATCH");if(ds1&&c==64&&id==atoi(ds1)&&in_h){hip_check(hipMalloc(&dbg_hidden,size_t(n)*4*c),"dbg_h1");}}
@@ -140,8 +141,8 @@ struct Block {
         launch_c32_fused(in_h, ffn_rw.as<u8>(), fs.as<float>(), qw_rw.as<u8>(), qs.as<float>(),
                          bias.as<float>(), p1_rw.as<u8>(), s1.as<float>(),
                         write_ffn ? s.bh.as<__half>() : nullptr, s.ah.as<__half>(),
-                        s.out16.as<__half>(), w, h, sw, sh, px, py, chain, windowed,
-                        write_f32_out);
+                        raster_f16 ? s.out16.as<__half>() : nullptr, w, h, sw, sh, px, py,
+                        chain, windowed, write_f32_out);
        return;
       }
       const char* mh_prod = std::getenv("DLSS5_MH_PROD");
@@ -218,7 +219,7 @@ struct Block {
     }
   void run(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
            const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true,
-           bool input_f16_exact=false){
+           bool input_f16_exact=false,bool raster_f16=true){
    bool use_h = in_h || (c==32 && input_f16_exact);
    bool use_f8 = c!=32 && in_f8 && !use_h;
    if(use_h){
@@ -228,7 +229,7 @@ struct Block {
    else if(use_f8) launch_reframe_f8in_f8out(in_f8,s.a8.as<u8>(),w,h,sw,sh,px,py,c);
    else launch_reframe_f32(in,s.a.as<float>(),w,h,sw,sh,px,py,c,0,0);
     window(use_h||use_f8?in:s.a.as<float>(),s.a.as<float>(),s,use_f8?s.a8.as<u8>():nullptr,emit_f8,
-           use_h?s.a16.as<__half>():nullptr,emit_h,write_f32_out);
+           use_h?s.a16.as<__half>():nullptr,emit_h,write_f32_out,raster_f16);
     if(const char* dump=std::getenv("DLSS5_DUMP_F8")){
      if(id>=0&&c==64){
       uint n2=sw*sh;std::vector<u8> d(size_t(n2)*c);
@@ -242,7 +243,7 @@ struct Block {
     }
     // Intermediate blocks can publish only the f8/f16 sibling consumed by the next
     // block; the f32 raster is materialized for the last block, pool/post-merge, or trace.
-    if(!write_f32_out) return;
+    if(!write_f32_out||!out) return;
     if(c==32)launch_reframe_f32_hin(s.ah.as<__half>(),out,w,h,sw,sh,px,py,c,1,0);
     else launch_reframe_f32(s.a.as<float>(),out,w,h,sw,sh,px,py,c,1,0);
   }
@@ -360,8 +361,11 @@ struct Network70::Impl {
     const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h;
     for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
   launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),dst,s.out16.as<__half>(),W,Ht,true);std::swap(src,dst);
-  blocks[70].run(src,dst,s,nullptr,false,s.out16.as<__half>(),false,true,false);std::swap(src,dst);mark(70,src,N*32);
-  launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
+  // block 70 publishes only the f16 sibling: the f32 raster write of post_merge and
+  // the reframe were dead traffic (block 70 reads the f16 chain, the head reads the
+  // f16 window output; both are f16-exact). Tracing still materializes the f32 raster.
+  blocks[70].run(src,tracing?dst:nullptr,s,nullptr,false,s.out16.as<__half>(),false,true,false,false);std::swap(src,dst);mark(70,src,N*32);
+  launch_head_f16(s.ah.as<__half>(),head_rgb.as<float>(),color.as<float>(),out.as<float>(),W,Ht,blocks[70].sw,blocks[70].sh,blocks[70].px,blocks[70].py);
    hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
    if(output_on_gpu){if(output!=out.p)hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToDevice,stream),"output d2d");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}
    else{hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}

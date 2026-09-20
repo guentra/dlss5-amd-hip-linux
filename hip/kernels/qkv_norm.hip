@@ -81,15 +81,15 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
                     float z = __half2float(__low2half(h1));
                     float w = __half2float(__high2half(h1));
                     *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
-                        u32(e4m3_byte(x)) | u32(e4m3_byte(y)) << 8 |
-                        u32(e4m3_byte(z)) << 16 | u32(e4m3_byte(w)) << 24;
+                        u32(e4m3_byte_fast(x)) | u32(e4m3_byte_fast(y)) << 8 |
+                        u32(e4m3_byte_fast(z)) << 16 | u32(e4m3_byte_fast(w)) << 24;
                 } else {
                     const float4 v = row < m
                         ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + c4)
                         : make_float4(0.f, 0.f, 0.f, 0.f);
                     *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
-                        u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                        u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                        u32(e4m3_byte_fast(v.x)) | u32(e4m3_byte_fast(v.y)) << 8 |
+                        u32(e4m3_byte_fast(v.z)) << 16 | u32(e4m3_byte_fast(v.w)) << 24;
                 }
             }
         }
@@ -139,9 +139,9 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
             inv *= scales[headg] * qgain;
         u32 w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (uint ch = 0; ch < 16u; ++ch)
-            w[ch >> 2] |= u32(e4m3_byte(s0[ch] * inv)) << ((ch & 3u) * 8u);
+            w[ch >> 2] |= u32(e4m3_byte_fast(s0[ch] * inv)) << ((ch & 3u) * 8u);
         for (uint ch = 0; ch < 16u; ++ch)
-            w[4u + (ch >> 2)] |= u32(e4m3_byte(s1[ch] * inv)) << ((ch & 3u) * 8u);
+            w[4u + (ch >> 2)] |= u32(e4m3_byte_fast(s1[ch] * inv)) << ((ch & 3u) * 8u);
         u8* out = output + (size_t)(first + row) * (3u * C) + headg * 32u;
         uint4* o4 = reinterpret_cast<uint4*>(out);
         o4[0] = make_uint4(w[0], w[1], w[2], w[3]);
@@ -153,7 +153,7 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);
             if (first + rc.x < m)
-                out[(size_t)rc.x * (3u * C) + rc.y] = e4m3_byte(acc.Get(i));
+                out[(size_t)rc.x * (3u * C) + rc.y] = e4m3_byte_fast(acc.Get(i));
         }
     }
 }
@@ -226,9 +226,9 @@ __global__ void __launch_bounds__(64) k_vit_qkv_norm(const float* input, const _
                 inv *= scales[head] * qgain;
             u32 w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             for (uint ch = 0; ch < 16u; ++ch)
-                w[ch >> 2] |= u32(e4m3_byte(s0[ch] * inv)) << ((ch & 3u) * 8u);
+                w[ch >> 2] |= u32(e4m3_byte_fast(s0[ch] * inv)) << ((ch & 3u) * 8u);
             for (uint ch = 0; ch < 16u; ++ch)
-                w[4u + (ch >> 2)] |= u32(e4m3_byte(s1[ch] * inv)) << ((ch & 3u) * 8u);
+                w[4u + (ch >> 2)] |= u32(e4m3_byte_fast(s1[ch] * inv)) << ((ch & 3u) * 8u);
             u8* out = output + (size_t)(first + row) * N + part * K + head * 32u;
             uint4* o4 = reinterpret_cast<uint4*>(out);
             o4[0] = make_uint4(w[0], w[1], w[2], w[3]);
@@ -239,7 +239,7 @@ __global__ void __launch_bounds__(64) k_vit_qkv_norm(const float* input, const _
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);
             if (first + rc.x < m)
-                out[(size_t)rc.x * N + rc.y] = e4m3_byte(acc.Get(i));
+                out[(size_t)rc.x * N + rc.y] = e4m3_byte_fast(acc.Get(i));
         }
     }
 }

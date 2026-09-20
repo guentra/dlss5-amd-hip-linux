@@ -658,13 +658,18 @@ void launch_up_f32_h(const float* lo,const float* skip,const float* scale,float*
 void launch_post_merge_f32(const float* lo,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low);}
 void launch_post_merge_f32_h(const float* lo,const float* pre,const float* scales,float* out,__half* out_h,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low,out_h);}
 void launch_head_f32(const float* in,const float* w,const float* color,float* out,uint n){LAUNCH(k_head_f32,(n+63)/64,64,in,w,color,out,n);}
+// The head reads block 70's windowed f16 output directly: block 70's values sit on
+// the f16 grid (H() round), so the f16 read is bit-identical to the f32 raster
+// while halving traffic and skipping the f32 reframe.
+void launch_head_f16(const __half* in,const float* w,const float* color,float* out,uint wsize,uint hsize,uint sw,uint sh,uint px,uint py){
+  LAUNCH(k_head_f16,(wsize*hsize+63)/64,64,in,w,color,out,wsize,hsize,sw,sh,px,py);}
 void launch_trace_f32(const float* in,uint n,float* stats,uint* bits){LAUNCH(k_trace_f32,1,256,in,n,stats,bits);}
 void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, const u8* qkv_w,
                       const float* qscale, const float* bias, const u8* proj_w, const float* proj_s,
                       __half* ffn_h, __half* out_h, __half* out_h_raster, uint w, uint h, uint sw,
                       uint sh, uint px, uint py, bool chain, bool windowed, bool write_out) {
     if (!in_h || !ffn_w || !ffn_s || !qkv_w || !qscale || !bias || !proj_w || !proj_s ||
-        !out_h || !out_h_raster || sw % 8 || sh % 8 ||
+        !out_h || sw % 8 || sh % 8 ||
         (windowed && (w + px > sw || h + py > sh)))
         throw std::runtime_error("C32 fused extent/alias");
     const uint nwin = sw * sh / 64u;

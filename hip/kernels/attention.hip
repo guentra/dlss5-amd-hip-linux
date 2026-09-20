@@ -82,7 +82,7 @@ __global__ void __launch_bounds__(128, 7) k_window_attention(const u8* qkv, cons
             u8* b = reinterpret_cast<u8*>(&v);
 #pragma unroll
             for (int t = 0; t < 16; t++)
-                b[t] = e4m3_byte(__half2float(scores[qi * 68 + q4 * 16 + t]) * inv);
+                b[t] = e4m3_byte_fast(__half2float(scores[qi * 68 + q4 * 16 + t]) * inv);
             p8r[q4] = v;
         }
     }
@@ -109,8 +109,8 @@ __global__ void __launch_bounds__(128, 7) k_window_attention(const u8* qkv, cons
         uint2 rc = av0.GetCoordinate(i);
         uint dst = packed ? (window * 64u + qtok + rc.x)
                           : window_pixel(window, qtok + rc.x, width);
-        output[dst * uint(C) + head * 32u + rc.y] = e4m3_byte(direct_f8 ? av0.Get(i) : H(av0.Get(i)));
-        output[dst * uint(C) + head * 32u + 16u + rc.y] = e4m3_byte(direct_f8 ? av1.Get(i) : H(av1.Get(i)));
+        output[dst * uint(C) + head * 32u + rc.y] = e4m3_byte_fast(direct_f8 ? av0.Get(i) : H(av0.Get(i)));
+        output[dst * uint(C) + head * 32u + 16u + rc.y] = e4m3_byte_fast(direct_f8 ? av1.Get(i) : H(av1.Get(i)));
     }
     __syncthreads();
     }

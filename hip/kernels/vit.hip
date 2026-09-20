@@ -57,8 +57,8 @@ __global__ void k_vit_ffn_fused(const float* input, const u8* w_expand, const u8
             const uint kk = k0 + i * 4u;
             const float4 v = *reinterpret_cast<const float4*>(input + (first + row) * CH + kk);
             *reinterpret_cast<u32*>(Ast + row * HSTRIDE + kk) =
-                u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                u32(e4m3_byte_fast(v.x)) | u32(e4m3_byte_fast(v.y)) << 8 |
+                u32(e4m3_byte_fast(v.z)) << 16 | u32(e4m3_byte_fast(v.w)) << 24;
         }
     }
     __syncthreads();
@@ -92,7 +92,7 @@ __global__ void k_vit_ffn_fused(const float* input, const u8* w_expand, const u8
             const uint col = wave * 64u + n * 16u;
             for (uint i = 0; i < acc[n].Length(); i++) {
                 uint2 rc = acc[n].GetCoordinate(i);
-                hid[rc.x * HSTRIDE + col + rc.y] = e4m3_byte(ActivatePoly(acc[n].Get(i)));
+                hid[rc.x * HSTRIDE + col + rc.y] = e4m3_byte_fast(ActivatePoly(acc[n].Get(i)));
             }
         }
         __syncthreads();
@@ -118,7 +118,7 @@ __global__ void k_vit_ffn_fused(const float* input, const u8* w_expand, const u8
         const uint col = wave * 64u + n * 16u;
         for (uint i = 0; i < total[n].Length(); i++) {
             uint2 rc = total[n].GetCoordinate(i);
-            output[(first + rc.x) * CH + col + rc.y] = from_e4m3(e4m3_byte(H(total[n].Get(i))));
+            output[(first + rc.x) * CH + col + rc.y] = from_e4m3(e4m3_byte_fast(H(total[n].Get(i))));
         }
     }
 }

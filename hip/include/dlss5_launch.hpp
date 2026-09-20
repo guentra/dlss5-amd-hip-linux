@@ -151,6 +151,7 @@ void launch_up_f32_h(const float*,const float*,const float*,float*,__half*,uint 
 void launch_post_merge_f32(const float*,const float*,const float*,float*,uint w,uint h,bool main8_low = false);
 void launch_post_merge_f32_h(const float*,const float*,const float*,float*,__half*,uint w,uint h,bool main8_low);
 void launch_head_f32(const float*,const float*,const float*,float*,uint n);
+void launch_head_f16(const __half*,const float*,const float*,float*,uint wsize,uint hsize,uint sw,uint sh,uint px,uint py);
 void launch_trace_f32(const float*,uint n,float*,uint*);
 void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, const u8* qkv_w,
                       const float* qscale, const float* bias, const u8* proj_w, const float* proj_s,

@@ -279,13 +279,15 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             __half hv = __float2half_rn(v);
             if constexpr (WRITE_OUT)
                 out_h[(window * 64u + row) * 32u + rc2.y] = hv;
-            if constexpr (WINDOWED) {
-                uint x = (window % (sw / 8u)) * 8u + (row % 8u);
-                uint y = (window / (sw / 8u)) * 8u + (row / 8u);
-                if (x >= px && y >= py && x < w + px && y < h + py)
-                    out_h_raster[((y - py) * w + (x - px)) * 32u + rc2.y] = hv;
-            } else
-                out_h_raster[(window * 64u + row) * 32u + rc2.y] = hv;
+            if (out_h_raster) {
+                if constexpr (WINDOWED) {
+                    uint x = (window % (sw / 8u)) * 8u + (row % 8u);
+                    uint y = (window / (sw / 8u)) * 8u + (row / 8u);
+                    if (x >= px && y >= py && x < w + px && y < h + py)
+                        out_h_raster[((y - py) * w + (x - px)) * 32u + rc2.y] = hv;
+                } else
+                    out_h_raster[(window * 64u + row) * 32u + rc2.y] = hv;
+            }
         }
 #pragma unroll
         for (uint i = 0; i < 8u; ++i) {
@@ -295,13 +297,15 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             __half hv = __float2half_rn(v);
             if constexpr (WRITE_OUT)
                 out_h[(window * 64u + row) * 32u + 16u + rc2.y] = hv;
-            if constexpr (WINDOWED) {
-                uint x = (window % (sw / 8u)) * 8u + (row % 8u);
-                uint y = (window / (sw / 8u)) * 8u + (row / 8u);
-                if (x >= px && y >= py && x < w + px && y < h + py)
-                    out_h_raster[((y - py) * w + (x - px)) * 32u + 16u + rc2.y] = hv;
-            } else
-                out_h_raster[(window * 64u + row) * 32u + 16u + rc2.y] = hv;
+            if (out_h_raster) {
+                if constexpr (WINDOWED) {
+                    uint x = (window % (sw / 8u)) * 8u + (row % 8u);
+                    uint y = (window / (sw / 8u)) * 8u + (row / 8u);
+                    if (x >= px && y >= py && x < w + px && y < h + py)
+                        out_h_raster[((y - py) * w + (x - px)) * 32u + 16u + rc2.y] = hv;
+                } else
+                    out_h_raster[(window * 64u + row) * 32u + 16u + rc2.y] = hv;
+            }
         }
     }
 }

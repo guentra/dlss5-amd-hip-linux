@@ -564,13 +564,30 @@ __global__ void k_up_f32(const float* lo,const float* skip,const float* scale,fl
   if(out)out[i]=r;
   if(out_h)out_h[i]=__float2half_rn(r);
 }
+// v ends on the f16 grid (outer H round). When the f16 sibling is published
+// (out_h != null) the f32 write is pure traffic: no consumer reads it (block 70
+// takes the f16 path, the head reads the f16 raster), so skip it.
 __global__ void k_post_merge_f32(const float* low,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low = false,__half* out_h=nullptr){
   uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=w*h*32)return;
   uint ch=i%32,p=i/32,lp=((p/w)/2)*(w/2)+(p%w)/2;
   float lo=main8_low?from_e4m3(e4m3_byte(low[lp*32+ch])):low[lp*32+ch];
   float v=H(H(lo*scales[ch])+from_e4m3(e4m3_byte(pre[i]))*scales[32+ch]);
-  out[i]=v;
+  if(!out_h)out[i]=v;
   if(out_h)out_h[i]=__float2half_rn(v);
+}
+// Head over block 70's windowed f16 output: same (px,py)-shifted win/tok remap as
+// k_reframe_f32<HIN>; the values are f16-exact, so this is bit-identical to
+// k_head_f32 on the reframed f32 raster.
+__global__ void k_head_f16(const __half* feat,const float* weights,const float* color,float* out,uint w,uint h,uint sw,uint sh,uint px,uint py){
+ uint p=blockIdx.x*blockDim.x+threadIdx.x;if(p>=w*h)return;
+ uint x=p%w,y=p/w,wx=x+px,wy=y+py;
+ uint win=(wy/8)*(sw/8)+wx/8,tok=(wy%8)*8+wx%8;
+ const __half* f=feat+(win*64u+tok)*32u;
+#pragma unroll
+ for(uint row=0;row<3;++row){float acc=0;
+#pragma unroll
+  for(uint c=0;c<32;++c)acc+=__half2float(f[c])*weights[row*32+c];
+  float base=color[p*4+row]*.125f-.0625f;float encoded=H(acc)*.03125f+base;out[p*3+row]=fminf(fmaxf(encoded*8.f+.5f,0.f),1.f);}
 }
 __global__ void k_head_f32(const float* feat,const float* weights,const float* color,float* out,uint n){
  uint p=blockIdx.x*blockDim.x+threadIdx.x;if(p>=n)return;
