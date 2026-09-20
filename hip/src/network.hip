@@ -254,12 +254,19 @@ struct Vit {
   ex=upload_tiled_e4m3(e.data(),4096,1024);ct=upload_tiled_e4m3(c.data(),1024,4096);cs=floats(c.data()+4194304,1024);
   qw=row_half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_e4m3(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
  }
-  void run(const float* in,float* out,Scratch&s){
-   // The expand output is already on the E4M3 grid; keeping the bytes lets the
-   // contract GEMM consume them directly (e4m3_byte(from_e4m3(q)) == q).
-   launch_linear_f32_f8out(in,ex.as<u8>(),nullptr,s.hidden8.as<u8>(),640,4096,1024,nullptr,nullptr,2,0);
-   launch_linear_f32_f8in(s.hidden8.as<u8>(),ct.as<u8>(),s.b.as<float>(),640,1024,4096,in,cs.as<float>(),1,2);
-  launch_qkv_norm_half(s.b.as<float>(),qw.as<__half>(),s.q8.as<u8>(),640,qs.as<float>(),5.65625f);
+   void run(const float* in,float* out,Scratch&s){
+    // Fused FFN is the default: byte-exact vs the split path (test_raw_pipeline)
+    // with the 4096-byte hidden rows kept in LDS. DLSS5_VIT_FFN_SPLIT=1 forces the
+    // legacy two-launch path for debugging.
+    if(!(std::getenv("DLSS5_VIT_FFN_SPLIT") && std::string(std::getenv("DLSS5_VIT_FFN_SPLIT")) == "1")){
+     launch_vit_ffn_fused(in,ex.as<u8>(),ct.as<u8>(),cs.as<float>(),s.b.as<float>(),640);
+    }else{
+    // The expand output is already on the E4M3 grid; keeping the bytes lets the
+    // contract GEMM consume them directly (e4m3_byte(from_e4m3(q)) == q).
+    launch_linear_f32_f8out(in,ex.as<u8>(),nullptr,s.hidden8.as<u8>(),640,4096,1024,nullptr,nullptr,2,0);
+    launch_linear_f32_f8in(s.hidden8.as<u8>(),ct.as<u8>(),s.b.as<float>(),640,1024,4096,in,cs.as<float>(),1,2);
+    }
+   launch_qkv_norm_half(s.b.as<float>(),qw.as<__half>(),s.q8.as<u8>(),640,qs.as<float>(),5.65625f);
    // The normalized QKV is already on the E4M3 grid, so attention can consume
    // the bytes directly; the f8 -> f32 round trip and re-quantize are redundant.
    launch_vit_attention_f8(s.q8.as<u8>(),s.att8.as<u8>(),640,1024);

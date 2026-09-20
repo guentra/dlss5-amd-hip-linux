@@ -373,6 +373,14 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
 }
 
 
+void launch_vit_ffn_fused(const float* in, const u8* w_expand, const u8* w_contract,
+                          const float* scales, float* out, uint tokens) {
+    if (!tokens || tokens % 16 || !in || !w_expand || !w_contract || !scales || !out ||
+        in == out)
+        throw std::runtime_error("vit ffn extent/alias");
+    LAUNCH(k_vit_ffn_fused, tokens / 16u, 512, in, w_expand, w_contract, scales, out);
+}
+
 void launch_ffn(int c, const u8* in, const u8* w, u8* out, uint tokens) {
     uint groups = grid_cap(tokens / 16);
     dim3 block(32 * (c / 16));
