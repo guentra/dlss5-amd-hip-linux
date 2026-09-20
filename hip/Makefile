@@ -49,18 +49,27 @@ endif
 CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES)
 TESTS := test_wmma test_stages test_quantize test_attention test_residual test_linear test_logical_ops test_ffn_f32
 
+# Preference: explicit MINGW_PREFIX, then the self-contained llvm-mingw
+# toolchains (their PEs carry no libgcc runtime imports), and only as a last
+# resort the distribution mingw found on PATH. A distro mingw GCC emits a
+# libgcc_s_seh-1.dll import that Proton prefixes do not provide, breaking
+# LoadLibrary of the trampoline in-game.
 ifeq ($(origin MINGW_CC), undefined)
   ifneq ($(MINGW_PREFIX),)
     MINGW_CC := $(MINGW_PREFIX)/bin/x86_64-w64-mingw32-gcc
   else
-    MINGW_CC := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
+    MINGW_CC := $(firstword $(wildcard \
+      $(CURDIR)/../toolchain/llvm-mingw*/bin/x86_64-w64-mingw32-gcc \
+      $(CURDIR)/../../toolchain/llvm-mingw*/bin/x86_64-w64-mingw32-gcc))
   endif
 endif
 ifeq ($(MINGW_CC),)
   MINGW_CC := $(firstword $(wildcard \
     $(if $(TOOLCHAIN_DIR),$(TOOLCHAIN_DIR)/bin/x86_64-w64-mingw32-gcc \
-                          $(TOOLCHAIN_DIR)/llvm-mingw*/bin/x86_64-w64-mingw32-gcc) \
-    $(CURDIR)/../toolchain/llvm-mingw*/bin/x86_64-w64-mingw32-gcc))
+                          $(TOOLCHAIN_DIR)/llvm-mingw*/bin/x86_64-w64-mingw32-gcc)))
+endif
+ifeq ($(MINGW_CC),)
+  MINGW_CC := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
 endif
 
 export HIPCC ROCM_PATH ARCH
@@ -118,7 +127,7 @@ libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/ke
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h
 	@test -n "$(MINGW_CC)" || { printf '%s\n' 'x86_64-w64-mingw32-gcc not found. Set MINGW_CC= or MINGW_PREFIX= or install mingw-w64.'; exit 2; }
-	$(MINGW_CC) -shared -O2 -o $@ src/trampoline.c
+	$(MINGW_CC) -shared -O2 -static -o $@ src/trampoline.c
 
 test: $(TESTS)
 	@set -e; for t in $(TESTS); do ./$$t; done
