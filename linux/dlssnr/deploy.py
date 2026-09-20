@@ -585,7 +585,14 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
                if dry_run else package.find_weights(weights_root, allow_derived_layouts=allow_derived_layouts))
     hip_files = ensure_hip_artifacts() if not dry_run else hip_paths()
     live_pair = 'vkd3d' in hip_files or 'vkd3dcore' in hip_files
-    if live_pair and not all(name in hip_files and hip_files[name].is_file() for name in ('vkd3d', 'vkd3dcore')):
+    # Only when something is actually being installed. hip_paths() names where
+    # the artifacts WOULD go, so in a source checkout none of them exist yet -
+    # enforcing the pair on a dry run made `doctor` and `--dry-run` fail with
+    # "the matching modified vkd3d DLL pair is required", which is both wrong
+    # (a dry run installs nothing) and unhelpful (it reads as a broken package
+    # rather than an unbuilt tree). ensure_hip_artifacts() above already
+    # guarantees presence on the real path.
+    if not dry_run and live_pair and not all(name in hip_files and hip_files[name].is_file() for name in ('vkd3d', 'vkd3dcore')):
         raise RuntimeError('The matching modified vkd3d DLL pair is required')
     if live_pair and magpie:
         raise RuntimeError('The HIP proof of concept currently supports the in-game FSR hook, not Magpie')
