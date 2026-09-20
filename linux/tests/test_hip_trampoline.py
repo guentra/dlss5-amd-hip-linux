@@ -27,7 +27,16 @@ def _tool(name):
         candidate = directory / name
         if candidate.is_file():
             return str(candidate)
-    return shutil.which(name)
+    found = shutil.which(name)
+    if found:
+        return found
+    # Debian/Ubuntu's llvm packages install versioned names only
+    # (llvm-readobj-21, never a bare llvm-readobj), so without this the
+    # disassembly test below skips on every machine in that family even with
+    # LLVM fully installed - a silent loss of coverage that looks like a
+    # missing toolchain.
+    versioned = sorted(pathlib.Path('/usr/bin').glob(name + '-*'))
+    return str(versioned[-1]) if versioned else None
 
 
 class TrampolineTests(unittest.TestCase):
@@ -66,6 +75,40 @@ class TrampolineTests(unittest.TestCase):
             # TLS diagnostics can change the allocated call-target register;
             # the argument ABI above, not a compiler's %rax choice, is fixed.
             self.assertRegex(disasm, r'callq\s+\*%r(?:[abcd]x|[89]|1[01])\b')
+
+    def test_built_dll_has_no_toolchain_runtime_imports(self):
+        """The trampoline must load with nothing but the game beside it.
+
+        Built by a GCC-flavoured mingw (Debian/Ubuntu's gcc-mingw-w64-x86-64,
+        what hip/Makefile's discovery finds when no llvm-mingw drop is
+        installed) the default link pulls in libgcc_s_seh-1.dll, which the
+        game's directory does not have. LoadLibrary then fails and the add-on
+        reports "dlss5_hip.dll missing (HIP trampoline)" - indistinguishable
+        from the file being absent, while it sits right there. Found by
+        deploying such a build and watching every frame fall back to the
+        original image."""
+        gcc = _tool('x86_64-w64-mingw32-gcc')
+        if not gcc:
+            self.skipTest('no mingw gcc available to build the trampoline')
+        objdump = shutil.which('objdump') or _tool('x86_64-w64-mingw32-objdump')
+        if not objdump:
+            self.skipTest('no objdump available to read the import table')
+        with tempfile.TemporaryDirectory() as tmp:
+            dll = pathlib.Path(tmp) / 'dlss5_hip.dll'
+            build = subprocess.run([str(gcc), '-shared', '-O2', '-static-libgcc',
+                                    '-o', str(dll), str(ROOT / 'hip' / 'src' / 'trampoline.c')],
+                                   text=True, capture_output=True)
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            dump = subprocess.run([str(objdump), '-p', str(dll)], text=True, capture_output=True)
+            self.assertEqual(dump.returncode, 0, dump.stderr)
+            imports = re.findall(r'DLL Name:\s*(\S+)', dump.stdout)
+            self.assertTrue(imports, dump.stdout)
+            # Every import has to be something Windows (or Wine) already
+            # provides, never a file the toolchain expects shipped alongside.
+            shipped = [name for name in imports
+                       if name.lower().startswith(('libgcc', 'libwinpthread', 'libstdc++'))]
+            self.assertEqual(shipped, [],
+                             'trampoline imports toolchain runtime DLLs: ' + ', '.join(imports))
 
     def test_live_unix_environment_only_and_forwarding(self):
         source = r'''
