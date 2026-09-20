@@ -80,7 +80,6 @@ def main() -> None:
         'dlssnr/runtime.py',
         'dlssnr/assets.py',
         'dlssnr/kernels.py',
-        'dlssnr/terminal.py',
     ]
     readme = (HERE / 'ARCHIVE-README.md').read_bytes() if (HERE / 'ARCHIVE-README.md').is_file() else (HERE / 'README.md').read_bytes()
     flags = (REPO / 'scripts' / 'game-flags.txt').read_text()

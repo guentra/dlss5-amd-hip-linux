@@ -47,7 +47,7 @@ class ReleaseArchiveTests(unittest.TestCase):
                          'dlssnr/__init__.py', 'dlssnr/cli.py', 'dlssnr/deploy.py',
                          'dlssnr/games.py', 'dlssnr/package.py', 'dlssnr/addon.py',
                          'dlssnr/convert_dll.py', 'dlssnr/runtime.py', 'dlssnr/assets.py',
-                         'dlssnr/kernels.py', 'dlssnr/terminal.py'):
+                         'dlssnr/kernels.py'):
                 files['linux/' + name] = '# synthetic package source fixture\n'
             for name, content in files.items():
                 path = root / name

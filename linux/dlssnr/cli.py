@@ -9,7 +9,7 @@ import platform
 import sys
 
 from . import VERSION, TAGLINE
-from . import addon, assets, deploy, games, kernels, package, runtime, terminal
+from . import addon, assets, deploy, games, kernels, package, runtime
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PACKAGE_ROOT.parent
@@ -360,12 +360,8 @@ def main(argv=None):
         return 2
     args = parser().parse_args(arguments or ['install'])
     interactive = sys.stdin.isatty() and not getattr(args, 'json', False)
-    tui = terminal.Tui()
-    if interactive:
-        tui.start()
     try:
-        # In TTY mode the fixed header line already shows version and tagline.
-        if not args.json and not tui.enabled:
+        if not args.json:
             print(f'dlss5-amd-hip {VERSION} — {TAGLINE}')
         if args.command in ('list-games', 'list-protons'):
             if args.command == 'list-games':
@@ -504,5 +500,3 @@ def main(argv=None):
     except (EOFError, KeyboardInterrupt):
         print('Cancelled. Run status before your next operation.', file=sys.stderr)
         return 130
-    finally:
-        tui.stop()
