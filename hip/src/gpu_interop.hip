@@ -377,6 +377,15 @@ void launch_temporal_blend(float* cur, const float* prev, int n, float w) {
   hip_check(hipGetLastError(), "launch temporal blend");
 }
 
+// Gated temporal blend: w/lo/hi contract of k_gc_temporal_blend_gated; requires lo < hi.
+void launch_temporal_blend_gated(float* cur, const float* prev, int n, float w, float lo, float hi) {
+  if (w <= 0.f || hi <= lo) return;
+  const int block = 256;
+  const int grid = (n + block - 1) / block;
+  k_gc_temporal_blend_gated<<<grid, block, 0, raw_stream()>>>(cur, prev, n, w, lo, hi);
+  hip_check(hipGetLastError(), "launch gated temporal blend");
+}
+
 // Guards the 1920x1080 RGB result: non-finite (all formats) or non-representable as
 // half (rgba16_float), mirroring the CPU pre-passes that bypass the whole frame.
 bool guard_result_f32(const float* dev, size_t n, bool need_half_repr) {

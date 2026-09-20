@@ -18,6 +18,9 @@ void launch_rgb_to_pix(const float* rgb, const uint8_t* alpha_src, uint8_t* out,
 // Shimmer fix for the non-temporal live path: cur = (1-w)*cur + w*prev over n floats.
 // w in [0,1); w<=0 is a no-op. Post-network smoothing stage (not part of the bench).
 void launch_temporal_blend(float* cur, const float* prev, int n, float w);
+// Gated variant (ghosting reduction): blend weight w is scaled by a per-element gate
+// that is 1 for |cur-prev|<=lo, 0 for |cur-prev|>=hi, linear between. Requires lo<hi.
+void launch_temporal_blend_gated(float* cur, const float* prev, int n, float w, float lo, float hi);
 // Whole-frame guards mirroring the CPU pre-passes; true when the frame must be
 // bypassed (non-finite input/output or non-representable half rounding).
 bool guard_result_f32(const float* dev, size_t n, bool need_half_repr);

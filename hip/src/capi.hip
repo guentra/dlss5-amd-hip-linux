@@ -96,6 +96,25 @@ static double temporal_blend_weight() {
     return w;
 }
 
+// Gated temporal blend thresholds (absolute 0..1 RGB difference). Full blend weight
+// for |cur-prev| <= lo, none for >= hi, linear between, so moving content is never
+// mixed with a misaligned previous frame (ghosting) while static regions keep the
+// shimmer fix. Read once; "off" (or an invalid value) falls back to the plain blend.
+struct TemporalBlendGate { bool enabled; float lo; float hi; };
+static TemporalBlendGate temporal_blend_gate() {
+    static const TemporalBlendGate g = [] {
+        const char* e = getenv("DLSS5_TEMPORAL_BLEND_GATE");
+        float lo = 4.f / 255.f, hi = 16.f / 255.f;
+        if (e && e[0]) {
+            if (std::string(e) == "off") return TemporalBlendGate{false, 0.f, 0.f};
+            float a = 0.f, b = 0.f;
+            if (std::sscanf(e, "%g,%g", &a, &b) == 2 && a >= 0.f && b > a) { lo = a; hi = b; }
+        }
+        return TemporalBlendGate{true, lo, hi};
+    }();
+    return g;
+}
+
 static void run_log(const char* s) {
     FILE* f = fopen("/tmp/dlss5-hip-run.log", "a");
     if (!f)
@@ -393,14 +412,20 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         ft.mark("sync");
         if (dlss5::gpu::guard_result_f32(b.decoded.as<float>(),n*3,fmt==dlss5::gpu::FmtRgba16F))
             return bypass();
-        // Temporal blend (shimmer fix): the live path is non-temporal (history reset
-        // every frame), so the network amplifies the input's per-frame micro-variation
-        // into visible shimmer. Mixing in the previous frame's decoded RGB low-passes
-        // that variation. w=blend_w is the previous-frame weight (0 disables it).
+        // Temporal blend (shimmer fix + ghosting gate): the live path is non-temporal
+        // (history reset every frame), so the network amplifies the input's per-frame
+        // micro-variation into visible shimmer. Mixing in the previous frame's decoded
+        // RGB low-passes that variation. w=blend_w is the previous-frame weight (0
+        // disables it). The gate keeps the blend only where the frames agree, so
+        // moving content passes through untouched instead of trailing a ghost.
         if (blend_w>0.f) {
             const size_t bn=n*3;
+            const TemporalBlendGate gate=temporal_blend_gate();
             if (b.prev_valid) {
-                dlss5::gpu::launch_temporal_blend(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w);
+                if (gate.enabled)
+                    dlss5::gpu::launch_temporal_blend_gated(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w,gate.lo,gate.hi);
+                else
+                    dlss5::gpu::launch_temporal_blend(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w);
                 dlss5::hip_check(hipMemcpy(b.prev_out.p,b.decoded.p,bn*4,hipMemcpyDeviceToDevice),"blend prev update");
             } else {
                 dlss5::hip_check(hipMemcpy(b.prev_out.p,b.decoded.p,bn*4,hipMemcpyDeviceToDevice),"blend prev init");

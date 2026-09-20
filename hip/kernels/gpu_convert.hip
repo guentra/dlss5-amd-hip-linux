@@ -213,5 +213,22 @@ __global__ void k_gc_temporal_blend(float* __restrict__ cur, const float* __rest
   }
 }
 
+// Gated temporal blend (ghosting reduction): same IIR as k_gc_temporal_blend where
+// the frames agree (|c-p| <= lo), no blend where they diverge (|c-p| >= hi), linear
+// gate between. Moving content passes the current frame through untouched (no ghost
+// trail) while static regions keep the shimmer fix; the residual ghost is bounded
+// because the unblended frame becomes the next frame's history.
+__global__ void k_gc_temporal_blend_gated(float* __restrict__ cur, const float* __restrict__ prev, int n,
+                                          float w, float lo, float hi) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    const float c = cur[i], p = prev[i];
+    const float d = fabsf(c - p);
+    const float g = fminf(fmaxf((hi - d) * (1.f / (hi - lo)), 0.f), 1.f);
+    const float k = w * g;
+    cur[i] = (1.f - k) * c + k * p;
+  }
+}
+
 }  // namespace gpu
 }  // namespace dlss5

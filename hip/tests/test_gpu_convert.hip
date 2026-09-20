@@ -121,6 +121,52 @@ static int run_out_case(unsigned dxgi,unsigned w,unsigned h,std::mt19937& rng){
  return 0;
 }
 
+// Temporal blend kernels: the gated variant must blend where the frames agree,
+// pass moving content through untouched, and scale linearly between; the plain
+// variant keeps its legacy formula.
+static int run_blend_case(){
+ constexpr int n=12; // 4 pixels x RGB
+ float hcur[12]={0.5f,0.5f,0.5f,   // p0: |d|=0.004 (<=lo) -> full gate
+                 0.5f,0.2f,0.9f,   // p1: one channel |d|=0.3 (>=hi) -> per-channel gate
+                 0.5f,0.5f,0.5f,   // p2: |d|=0.03 (mid) -> half gate
+                 0.3f,0.3f,0.3f};  // p3: identical -> no-op
+ float hprev[12]={0.496f,0.496f,0.496f,
+                  0.8f,0.2f,0.9f,
+                  0.53f,0.53f,0.53f,
+                  0.3f,0.3f,0.3f};
+ const float w=0.5f,lo=0.02f,hi=0.04f;
+ DeviceBuf gcur(size_t(n)*4),gprev(size_t(n)*4);
+ gcur.upload(hcur,size_t(n)*4);
+ gprev.upload(hprev,size_t(n)*4);
+ std::vector<float> gout(n);
+ launch_temporal_blend_gated(gcur.as<float>(),gprev.as<float>(),n,w,lo,hi);
+ hipStreamSynchronize(nullptr);
+ gcur.download(gout.data(),size_t(n)*4);
+ for(int i=0;i<n;++i){
+   const float d=fabsf(hcur[i]-hprev[i]);
+   const float g=fminf(fmaxf((hi-d)*(1.f/(hi-lo)),0.f),1.f);
+   const float k=w*g;
+   const float exp=(1.f-k)*hcur[i]+k*hprev[i];
+   if(std::memcmp(&gout[i],&exp,4)){
+     printf("BLEND gated i=%d: gpu=%.9g expected=%.9g (cur=%.9g prev=%.9g)\n",
+            i,(double)gout[i],(double)exp,(double)hcur[i],(double)hprev[i]);
+     return 1;
+   }
+ }
+ gcur.upload(hcur,size_t(n)*4);
+ launch_temporal_blend(gcur.as<float>(),gprev.as<float>(),n,w);
+ hipStreamSynchronize(nullptr);
+ gcur.download(gout.data(),size_t(n)*4);
+ for(int i=0;i<n;++i){
+   const float exp=(1.f-w)*hcur[i]+w*hprev[i];
+   if(std::memcmp(&gout[i],&exp,4)){
+     printf("BLEND plain i=%d: gpu=%.9g expected=%.9g\n",i,(double)gout[i],(double)exp);
+     return 1;
+   }
+ }
+ return 0;
+}
+
 int main(){
  std::mt19937 rng(0x5eed);
  struct Geo{unsigned w,h;};
@@ -133,6 +179,7 @@ int main(){
     rc=run_out_case(dxgi,g.w,g.h,rng);
     if(rc)++fails;
   }
+ if(run_blend_case())++fails;
  printf("gpu_convert bit-exact: %s (%d failures)\n",fails?"FAIL":"PASS",fails);
  return fails?1:0;
 }
