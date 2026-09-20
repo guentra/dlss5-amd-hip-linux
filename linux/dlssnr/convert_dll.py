@@ -578,13 +578,15 @@ def validate_cache(path, *, audit_only=False, layout_mode=None):
         raise RuntimeError(f'invalid or incomplete cache: {exc}') from exc
 
 
-def convert_nvidia_dll(dll_path: Path, output: Path | None = None, *, audit_only=False, layout_mode=None) -> Path:
+def convert_nvidia_dll(dll_path: Path, output: Path | None = None, *, audit_only=False,
+                       layout_mode=None, progress=None) -> Path:
     """Default fails closed. audit_only=True writes explicitly incomplete tables.
 
     layout_mode='amd-consumer-derived' enables an explicitly EXPERIMENTAL
     complete cache, not NVIDIA-equivalent or upstream-captured layouts.
     Never reuses the old unversioned cache. Existing output is verified, never
     repaired in place; stale/partial directories require a fresh output path.
+    progress, if given, is called as progress(done, total, table_name).
     """
     derived = _experimental(layout_mode)
     if audit_only and derived:
@@ -619,6 +621,13 @@ def convert_nvidia_dll(dll_path: Path, output: Path | None = None, *, audit_only
         raise RuntimeError('nonfinite scalar record')
     cache.mkdir(parents=True,exist_ok=False)
     expected,entries = expected_tables(layout_mode=layout_mode),{}
+    total_tables = len(expected) + (len(BRIDGE_HASHES) if derived else 0)
+    done_tables = 0
+    def report(name):
+        nonlocal done_tables
+        done_tables += 1
+        if progress is not None:
+            progress(done_tables,total_tables,name)
     def payload(block,layer=0):
         return payloads[f'block{block}.layer{layer}.layer']
     def emit(name,values):
@@ -628,6 +637,7 @@ def convert_nvidia_dll(dll_path: Path, output: Path | None = None, *, audit_only
             raise RuntimeError(f'nonfinite decoded coefficient: {name}')
         _write_f32(cache/name,values)
         entries[name] = {'count':len(values),'sha256':sha256_file(cache/name)}
+        report(name)
     mix,pre_body = _preblock(payload(0))
     emit('block0-mix.audit.f32',mix)
     post_body,scales,head = _post70(payload(70))
@@ -675,6 +685,7 @@ def convert_nvidia_dll(dll_path: Path, output: Path | None = None, *, audit_only
                 values.byteswap()
             (cache/name).write_bytes(values.tobytes())
             entries[name] = {'count':len(values),'sha256':sha256_file(cache/name)}
+            report(name)
     _validate_tables(cache,entries,expected)
     manifest: dict = dict(schema=CACHE_VERSION,source_sha256=KNOWN_NVIDIA_SHA,
                     upstream_commit=UPSTREAM_COMMIT,archive_records=len(records),

@@ -23,6 +23,12 @@ SCHEMA = 2
 # (ReShade re-saves its own settings on exit); a changed copy must not block
 # a reinstall, and install regenerates them from the proxy template anyway.
 RUNTIME_MUTABLE = {'ReShade.ini'}
+
+
+class ChangedDeploymentError(RuntimeError):
+    """A previous deployment differs from its journal; overwriting needs consent."""
+
+
 NOTES = [
     'D3D path: this deploys the ReShade add-on and package shaders without native HIP.',
     'SM 6.10 wave-matrix requires the corresponding D3D12 runtime and driver support; successful installation does not verify rendering under vkd3d-proton.',
@@ -419,7 +425,7 @@ def status_game(exe):
         changed = [name for name, item in data['files'].items()
                    if name not in RUNTIME_MUTABLE and _digest(exe.parent / name) != item['sha256']]
         if changed:
-            return {'installed': True, 'valid': False, 'pending': True,
+            return {'installed': True, 'valid': False, 'pending': True, 'changed': changed,
                     'notes': ['Changed deployed files: ' + ', '.join(changed[:8])]}
         if data.get('bridge_cache'):
             cache = Path(data['bridge_cache'])
@@ -436,6 +442,25 @@ def status_game(exe):
                      'bridge_cache': data.get('bridge_cache')}, **prefix_paths(exe))
     except (RuntimeError, OSError, ValueError) as exc:
         return {'installed': True, 'valid': False, 'pending': True, 'notes': [str(exc)]}
+
+
+def previous_deployment(exe):
+    """Describe a managed deployment left by a previous operation, if any."""
+    exe = _exe(exe)
+    store = exe.parent / STORE
+    if not store.exists():
+        return {'present': False, 'state': None, 'valid': False, 'reusable': False, 'changed': []}
+    try:
+        data = _load(exe)
+    except (RuntimeError, OSError, ValueError):
+        data = {}
+    state = data.get('state')
+    if state in (None, 'removed'):
+        return {'present': False, 'state': state, 'valid': False, 'reusable': False, 'changed': []}
+    status = status_game(exe)
+    return {'present': True, 'state': state, 'valid': status['valid'],
+            'reusable': state == 'installed' and status['valid'],
+            'changed': status.get('changed', []), 'notes': status.get('notes', [])}
 
 
 def _first_file(*candidates):
@@ -554,15 +579,32 @@ def _overlay_bytes(exe, relative, content, files, store, mode=0o644):
     _atomic_bytes(exe.parent / relative, content, mode)
 
 
-def _begin_install(exe, *, hip, mode, **metadata):
+def _overwrite_previous(exe, store):
+    """Wipe a previous managed deployment (any state, modifications included)."""
+    if not store.exists():
+        return
+    try:
+        previous = _load(exe)
+    except (RuntimeError, OSError, ValueError):
+        previous = {}
+    if previous.get('state') not in (None, 'removed') and previous.get('files'):
+        _teardown(exe, store, previous, tolerant=True)
+
+
+def _begin_install(exe, *, hip, mode, force=False, **metadata):
     store = exe.parent / STORE
     files = {}
     if store.exists():
         previous = _load(exe)
         if previous.get('state') != 'removed':
-            if previous.get('state') != 'installed' or not status_game(exe)['valid']:
-                raise RuntimeError('Incomplete or changed deployment; preserve backups and uninstall/recover before reinstalling')
-            if previous.get('hip', False) != hip or previous.get('mode') != mode:
+            status = status_game(exe)
+            if previous.get('state') != 'installed' or not status['valid']:
+                if not force:
+                    detail = '; '.join(status.get('notes', [])) or 'incomplete journal'
+                    raise ChangedDeploymentError(
+                        'Previous installation is modified or incomplete: ' + detail
+                        + '. Overwrite it with --overwrite (or answer yes when prompted), or uninstall first.')
+            elif previous.get('hip', False) != hip or previous.get('mode') != mode:
                 raise RuntimeError('Uninstall before switching deployment backend or loader mode')
             files = dict(previous['files'])
     store.mkdir(mode=0o700, exist_ok=True)
@@ -574,7 +616,7 @@ def _begin_install(exe, *, hip, mode, **metadata):
 
 def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
                 acknowledge_risk=False, dry_run=False, gpu_name=None, allow_derived_layouts=False,
-                gpu=None, hip_library=None):
+                gpu=None, hip_library=None, force=False, progress=None):
     if not acknowledge_risk:
         raise RuntimeError('Explicit --accept-risk is required; this injects a ReShade add-on into the game directory')
     exe = _exe(exe)
@@ -582,7 +624,8 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
         if type(gpu.get('index')) is not int or gpu['index'] < 0 or not isinstance(gpu.get('name'), str) or not gpu['name']:
             raise RuntimeError('Select an explicit GPU index and name')
     weights = (Path(package.inspect_weights(weights_root, allow_derived_layouts=allow_derived_layouts).get('weights_dir', weights_root))
-               if dry_run else package.find_weights(weights_root, allow_derived_layouts=allow_derived_layouts))
+               if dry_run else package.find_weights(weights_root, allow_derived_layouts=allow_derived_layouts,
+                                                    progress=progress))
     hip_files = ensure_hip_artifacts() if not dry_run else hip_paths()
     live_pair = 'vkd3d' in hip_files or 'vkd3dcore' in hip_files
     if live_pair and not all(name in hip_files and hip_files[name].is_file() for name in ('vkd3d', 'vkd3dcore')):
@@ -643,11 +686,13 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
         if dry_run:
             result['collisions'] = collisions
             return result
+        if force:
+            _overwrite_previous(exe, store)
         data = _begin_install(exe, hip=True, mode='magpie' if magpie else 'game', weights=str(weights),
                               gpu=gpu, hip_library=str(library) if library else None,
                               hip_library_sha256=library_digest,
                               bridge_cache=str(cache) if cache else None,
-                              bridge_cache_sha256=so_digest)
+                              bridge_cache_sha256=so_digest, force=force)
         for name in ('backups', 'logs', 'lib'):
             (store / name).mkdir(mode=0o700, exist_ok=True)
         files = data['files']
@@ -695,11 +740,12 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
 
 
 def install_package(exe, package_root, *, magpie=False, replace_existing=False,
-                    acknowledge_risk=False, dry_run=False, gpu_name=None, hip=False, allow_derived_layouts=False):
+                    acknowledge_risk=False, dry_run=False, gpu_name=False, hip=False,
+                    allow_derived_layouts=False, force=False, progress=None):
     if hip:
         return install_hip(exe, package_root, magpie=magpie, replace_existing=replace_existing,
                            acknowledge_risk=acknowledge_risk, dry_run=dry_run, gpu_name=gpu_name,
-                           allow_derived_layouts=allow_derived_layouts)
+                           allow_derived_layouts=allow_derived_layouts, force=force, progress=progress)
     if not acknowledge_risk:
         raise RuntimeError('Explicit --accept-risk is required; this injects a ReShade add-on into the game directory')
     exe = _exe(exe)
@@ -728,7 +774,9 @@ def install_package(exe, package_root, *, magpie=False, replace_existing=False,
         if dry_run:
             result['collisions'] = collisions
             return result
-        data = _begin_install(exe, hip=False, mode=info['mode'], package=info['root'])
+        if force:
+            _overwrite_previous(exe, store)
+        data = _begin_install(exe, hip=False, mode=info['mode'], package=info['root'], force=force)
         for name in ('backups', 'logs'):
             (store / name).mkdir(mode=0o700, exist_ok=True)
         files = data['files']
@@ -741,7 +789,64 @@ def install_package(exe, package_root, *, magpie=False, replace_existing=False,
         return dict(status_game(exe), installed=True, dry_run=False, hip=False)
 
 
-def uninstall_game(exe, *, yes=False):
+def _teardown(exe, store, data, *, tolerant=False):
+    # Preflight every path before the first restore/delete. A changed late
+    # entry must not leave the earlier half of the installation removed.
+    backups = []
+    changed = []
+    for relative, item in data['files'].items():
+        target = _safe(exe.parent / relative, missing=True)
+        original = item.get('original')
+        if original:
+            backup = store / 'backups' / relative.replace('/', '__')
+            if _digest(backup) != original:
+                raise RuntimeError(f'Backup missing or changed: {relative}')
+            backups.append(backup)
+        if target.is_file():
+            allowed = {item['sha256']}
+            if data.get('state') in {'installing', 'uninstalling'}:
+                allowed.update((original, item.get('previous_sha256')))
+            # ReShade re-saves its settings at runtime; the file is
+            # regenerated on install and deleted/restored on uninstall.
+            if relative not in RUNTIME_MUTABLE and _digest(target) not in allowed:
+                changed.append(relative)
+    if changed and not tolerant:
+        raise ChangedDeploymentError(
+            'Changed deployed files would be removed or restored: '
+            + ', '.join(changed[:12]) + (' ...' if len(changed) > 12 else '')
+            + '. Overwrite them with --overwrite (or answer yes when prompted); the changed content is discarded.')
+    data['state'] = 'uninstalling'
+    _journal(store, data)
+    for relative, item in data['files'].items():
+        target = exe.parent / relative
+        original = item.get('original')
+        if original:
+            backup = store / 'backups' / relative.replace('/', '__')
+            if not backup.is_file() or package.sha256(backup) != original:
+                raise RuntimeError(f'Backup missing or changed: {relative}')
+            _atomic_copy(backup, target, original)
+        elif target.is_file():
+            target.unlink()
+            parent = target.parent
+            while parent != exe.parent and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+    for backup in backups:
+        backup.unlink()
+    data['state'] = 'removed'
+    data['files'] = {}
+    _journal(store, data)
+    journal = store / 'manifest.json'
+    for leftover in sorted(store.rglob('*'), reverse=True):
+        if leftover.is_dir() and not leftover.is_symlink() and not any(leftover.iterdir()):
+            leftover.rmdir()
+    if set(store.iterdir()) == {journal}:
+        journal.unlink()
+        store.rmdir()
+    return changed
+
+
+def uninstall_game(exe, *, yes=False, force=False):
     if not yes:
         raise RuntimeError('Pass --yes to restore backups and remove the dlss5 files')
     exe = _exe(exe)
@@ -750,51 +855,5 @@ def uninstall_game(exe, *, yes=False):
             raise RuntimeError('Close the game before uninstall')
         data = _load(exe)
         store = exe.parent / STORE
-        # Preflight every path before the first restore/delete. A changed late
-        # entry must not leave the earlier half of the installation removed.
-        backups = []
-        for relative, item in data['files'].items():
-            target = _safe(exe.parent / relative, missing=True)
-            original = item.get('original')
-            if original:
-                backup = store / 'backups' / relative.replace('/', '__')
-                if _digest(backup) != original:
-                    raise RuntimeError(f'Backup missing or changed: {relative}')
-                backups.append(backup)
-            if target.is_file():
-                allowed = {item['sha256']}
-                if data.get('state') in {'installing', 'uninstalling'}:
-                    allowed.update((original, item.get('previous_sha256')))
-                # ReShade re-saves its settings at runtime; the file is
-                # regenerated on install and deleted/restored on uninstall.
-                if relative not in RUNTIME_MUTABLE and _digest(target) not in allowed:
-                    raise RuntimeError(f'Refusing to remove a changed deployed file: {relative}')
-        data['state'] = 'uninstalling'
-        _journal(store, data)
-        for relative, item in data['files'].items():
-            target = exe.parent / relative
-            original = item.get('original')
-            if original:
-                backup = store / 'backups' / relative.replace('/', '__')
-                if not backup.is_file() or package.sha256(backup) != original:
-                    raise RuntimeError(f'Backup missing or changed: {relative}')
-                _atomic_copy(backup, target, original)
-            elif target.is_file():
-                target.unlink()
-                parent = target.parent
-                while parent != exe.parent and parent.is_dir() and not any(parent.iterdir()):
-                    parent.rmdir()
-                    parent = parent.parent
-        for backup in backups:
-            backup.unlink()
-        data['state'] = 'removed'
-        data['files'] = {}
-        _journal(store, data)
-        journal = store / 'manifest.json'
-        for leftover in sorted(store.rglob('*'), reverse=True):
-            if leftover.is_dir() and not leftover.is_symlink() and not any(leftover.iterdir()):
-                leftover.rmdir()
-        if set(store.iterdir()) == {journal}:
-            journal.unlink()
-            store.rmdir()
+        _teardown(exe, store, data, tolerant=force)
         return {'installed': False, 'removed': True, 'notes': ['Remove the wrapper from your launcher settings.']}

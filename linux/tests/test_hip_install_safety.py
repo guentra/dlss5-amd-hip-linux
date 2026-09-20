@@ -149,6 +149,35 @@ class HipStagingSafetyTests(unittest.TestCase):
             self.assertEqual(loader.read_bytes(), b'user loader')
             self.assertFalse((exe.parent / 'dlss5_hip.dll').exists())
 
+    def test_install_refuses_modified_deployment_until_overwrite_is_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe, weights, artifacts = fixture(root)
+            with patch.object(deploy, 'ensure_hip_artifacts', return_value=artifacts):
+                deploy.install_hip(exe, weights, acknowledge_risk=True)
+            dll = exe.parent / 'dlss5_hip.dll'
+            dll.write_bytes(b'user changed DLL')
+            with self.assertRaises(deploy.ChangedDeploymentError):
+                deploy.install_hip(exe, weights, acknowledge_risk=True)
+            self.assertEqual(dll.read_bytes(), b'user changed DLL', 'refused install touched the file')
+            with patch.object(deploy, 'ensure_hip_artifacts', return_value=artifacts):
+                self.assertTrue(deploy.install_hip(exe, weights, acknowledge_risk=True, force=True)['valid'])
+            self.assertEqual(dll.read_bytes(), artifacts['dll'].read_bytes())
+
+    def test_uninstall_force_overrides_changed_file_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe, weights, artifacts = fixture(root)
+            with patch.object(deploy, 'ensure_hip_artifacts', return_value=artifacts):
+                deploy.install_hip(exe, weights, acknowledge_risk=True)
+            dll = exe.parent / 'dlss5_hip.dll'
+            dll.write_bytes(b'user changed DLL')
+            with self.assertRaises(deploy.ChangedDeploymentError):
+                deploy.uninstall_game(exe, yes=True)
+            self.assertEqual(dll.read_bytes(), b'user changed DLL', 'refused uninstall touched the file')
+            self.assertTrue(deploy.uninstall_game(exe, yes=True, force=True)['removed'])
+            self.assertFalse(dll.exists())
+
     def test_existing_activation_markers_refuse_without_deleting_user_files(self):
         for name in ('continuous-every-frame.txt', 'continuous-reset-preview.txt',
                      'neural-frame-request.txt'):

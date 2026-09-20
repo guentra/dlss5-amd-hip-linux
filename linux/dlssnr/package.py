@@ -99,7 +99,7 @@ def inspect_weights(path: Path, *, allow_derived_layouts=False) -> dict:
             'layout_mode': manifest.get('layout_mode', 'external-tables')}
 
 
-def find_weights(path: Path, *, allow_derived_layouts=False) -> Path:
+def find_weights(path: Path, *, allow_derived_layouts=False, progress=None) -> Path:
     """Directory that holds .f32/.f16/.i32 network tables (package, assets, or NVIDIA DLL)."""
     root = Path(path).expanduser().absolute()
     for parent in (root, *root.parents):
@@ -109,7 +109,7 @@ def find_weights(path: Path, *, allow_derived_layouts=False) -> Path:
         if not allow_derived_layouts:
             raise RuntimeError('Conversion requires --allow-derived-layouts (experimental, not NVIDIA equivalence)')
         from .convert_dll import convert_nvidia_dll
-        return convert_nvidia_dll(root, layout_mode='amd-consumer-derived')
+        return convert_nvidia_dll(root, layout_mode='amd-consumer-derived', progress=progress)
     if root.is_symlink() or not root.is_dir():
         raise RuntimeError(
             'Pass a weights directory, an dlss5 package folder, or nvngx_dlssnr.dll '

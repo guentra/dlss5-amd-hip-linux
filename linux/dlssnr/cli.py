@@ -36,6 +36,9 @@ def parser():
         command.add_argument('--json', action='store_true', help='Machine-readable JSON output')
         if name == 'uninstall':
             command.add_argument('--yes', action='store_true', help='Confirm restoring original files')
+        if name in ('install', 'uninstall'):
+            command.add_argument('--overwrite', action='store_true',
+                                 help='Overwrite a previous installation, even if modified, without asking')
         if name in ('install', 'doctor'):
             command.add_argument('--runner', '--proton', dest='proton', type=Path,
                                  help='Installed Wine/Proton runner directory used by this game')
@@ -190,6 +193,30 @@ def require(accepted, interactive, question, flag):
     if interactive and input(question + ' [y/N] ').strip().casefold() in ('y', 'yes'):
         return
     raise RuntimeError(f'Explicit confirmation required: {flag}. {question}')
+
+
+def weight_progress(args):
+    """Progress reporter for the NVIDIA DLL -> weights conversion (None silences it)."""
+    if args.json:
+        return None
+    out = sys.stdout
+    tty = out.isatty()
+
+    def progress(done, total, label=None):
+        if tty:
+            pct = 100.0 * done / total
+            filled = int(pct // 5)
+            out.write('\r  extracting weights  [%s%s] %3d%% %d/%d %s'
+                      % ('#' * filled, '.' * (20 - filled), pct, done, total, label or ''))
+            out.flush()
+            if done >= total:
+                out.write('\n')
+        elif done == 1 or done % 50 == 0 or done >= total:
+            out.write('Extracting weights from nvngx_dlssnr.dll: %d/%d tables%s\n'
+                      % (done, total, ' (' + label + ')' if label else ''))
+            out.flush()
+
+    return progress
 
 
 def data_dir(args):
@@ -411,7 +438,14 @@ def main(argv=None):
             return 1 if status['pending'] else 0
         if args.command == 'uninstall':
             require(args.yes, interactive, 'Restore original files and uninstall?', '--yes')
-            result = deploy.uninstall_game(exe, yes=True)
+            try:
+                result = deploy.uninstall_game(exe, yes=True, force=args.overwrite)
+            except deploy.ChangedDeploymentError as exc:
+                if not interactive:
+                    raise
+                print(str(exc))
+                require(False, interactive, 'Overwrite the changed files and continue?', '--overwrite')
+                result = deploy.uninstall_game(exe, yes=True, force=True)
             actual = deploy.status_game(exe)
             if actual['installed'] or actual['pending']:
                 raise RuntimeError('Restore incomplete; retain all backups and the journal.')
@@ -486,10 +520,23 @@ def main(argv=None):
             require(args.allow_derived_layouts, interactive,
                     'Accept experimental reconstructed weight layouts (not NVIDIA equivalence)?',
                     '--allow-derived-layouts')
-        result = deploy.install_hip(exe, weights_root, magpie=args.magpie,
-                                    replace_existing=args.replace_existing,
-                                    acknowledge_risk=True, dry_run=False, gpu=gpu,
-                                    hip_library=rt.get('library'), allow_derived_layouts=True)
+            if not args.json:
+                print('Extracting network weights from the NVIDIA DLL ...')
+
+        def do_install(force_overwrite):
+            return deploy.install_hip(exe, weights_root, magpie=args.magpie,
+                                      replace_existing=args.replace_existing,
+                                      acknowledge_risk=True, dry_run=False, gpu=gpu,
+                                      hip_library=rt.get('library'), allow_derived_layouts=True,
+                                      force=force_overwrite, progress=weight_progress(args))
+        try:
+            result = do_install(args.overwrite)
+        except deploy.ChangedDeploymentError as exc:
+            if not interactive:
+                raise
+            print(str(exc))
+            require(False, interactive, 'Overwrite the previous installation?', '--overwrite')
+            result = do_install(True)
         result['warnings'] = warnings
         result['gpu'] = gpu
         emit(result, args)

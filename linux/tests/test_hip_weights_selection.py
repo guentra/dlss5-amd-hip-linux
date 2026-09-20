@@ -45,7 +45,7 @@ class WeightSelectionTests(unittest.TestCase):
                     package.find_weights(source)
                 convert.assert_not_called()
                 self.assertEqual(package.find_weights(source, allow_derived_layouts=True), Path(tmp) / 'cache')
-                convert.assert_called_once_with(source, layout_mode='amd-consumer-derived')
+                convert.assert_called_once_with(source, layout_mode='amd-consumer-derived', progress=None)
 
     def test_derived_folder_requires_consent_and_keeps_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
