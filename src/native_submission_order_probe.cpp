@@ -7,8 +7,10 @@ static bool fit_small_input();
 #include "native_lab_paths.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winver.h>
 #include <d3d12.h>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <exception>
 #include "reshade.hpp"
@@ -19,6 +21,10 @@ static bool fit_small_input();
 static NativeGameOneShot neural_oneshot;
 #include "native_hip_live.h"
 static NativeHipLive hip_live;
+#include "native_fsr3_layout_gate.h"
+// Which dispatch entry point owns the live path (see claim_live_route).
+// Declared with hip_live because both dispatch handlers below consult it.
+static std::atomic<int> live_route_owner{LiveRouteNone};
 #endif
 #ifdef NATIVE_ORDER_SNAPSHOT
 #include "native_submitted_readback.h"
@@ -68,6 +74,20 @@ static bool ffx_state_to_d3d12(uint32_t s,D3D12_RESOURCE_STATES&out){
   case 20:out=D3D12_RESOURCE_STATE_GENERIC_READ;return true;case 128:out=D3D12_RESOURCE_STATE_PRESENT;return true;case 256:out=D3D12_RESOURCE_STATE_RENDER_TARGET;return true;
   default:return false;
  }
+}
+// Real DLL file version (e.g. games ship different FidelityFX SDK builds over
+// time with different ABI-compatible-looking but differently-laid-out dispatch
+// structs) - the same version stamp danielblnc's own runtime already reads and
+// logs for these exact FFX DLLs. Static 4KB buffer: version resources are small.
+static bool module_file_version(HMODULE m,wchar_t*out,size_t out_len){
+ wchar_t path[MAX_PATH]{};if(!GetModuleFileNameW(m,path,MAX_PATH))return false;
+ DWORD handle=0;DWORD size=GetFileVersionInfoSizeW(path,&handle);if(!size||size>4096)return false;
+ unsigned char buf[4096];if(!GetFileVersionInfoW(path,handle,sizeof buf,buf))return false;
+ VS_FIXEDFILEINFO*info=nullptr;UINT info_len=0;
+ if(!VerQueryValueW(buf,L"\\",reinterpret_cast<void**>(&info),&info_len)||!info)return false;
+ swprintf(out,out_len,L"%u.%u.%u.%u",HIWORD(info->dwFileVersionMS),LOWORD(info->dwFileVersionMS),
+  HIWORD(info->dwFileVersionLS),LOWORD(info->dwFileVersionLS));
+ return true;
 }
 static D3D12_RESOURCE_STATES notice_state=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 static void draw_pending_notice(ID3D12CommandQueue*q){
@@ -234,7 +254,8 @@ static uint32_t dispatch(void**context,const Header*h){
  // HIP_LIVE_ROUTE_BEGIN
  if(NativeHipRequested()){
   D3D12_RESOURCE_STATES live_state{};
-  if(result==0&&list&&output.resource&&ffx_state_to_d3d12(output.state,live_state))
+  if(result==0&&list&&output.resource&&ffx_state_to_d3d12(output.state,live_state)&&
+     claim_live_route(live_route_owner,LiveRouteUnified))
    hip_live.Record(static_cast<ID3D12GraphicsCommandList*>(list),static_cast<ID3D12Resource*>(output.resource),live_state,n);
   return result; // Never enter the old post-ECL readback/wait path for HIP.
  }
@@ -287,6 +308,69 @@ static uint32_t dispatch(void**context,const Header*h){
  return result;
 }
 #ifdef NATIVE_ORDER_NEURAL
+// Older, non-unified FSR3 upscaler dispatch (ffx_fsr3upscaler_x64.dll!
+// ffxFsr3UpscalerContextDispatch) - some titles (Cyberpunk 2077) call this
+// directly instead of the unified ffxDispatch hooked above. Field order from
+// AMD's public FidelityFX-SDK (FfxFsr3UpscalerDispatchDescription); confirmed
+// live against a real capture (docs/linux-support-spec.md) that this game's
+// build carries an embedded per-resource debug-name buffer AMD's current SDK
+// header no longer has, making each resource entry 176 bytes (48 + a
+// FFX_RESOURCE_NAME_SIZE=64 wchar_t name), not 48. Confirmed via `output`
+// landing at exactly commandList+9*176 with real 2560x1440 dimensions.
+struct Fsr3ResourceEntry : ResourcePayload { wchar_t name[64]; };
+static_assert(sizeof(Fsr3ResourceEntry)==176,"FSR3 named-resource layout (this game's SDK build)");
+struct Fsr3UpscalerDispatchDescription {
+ void*commandList;
+ Fsr3ResourceEntry color,depth,motionVectors,exposure,reactive,transparencyAndComposition,
+  dilatedDepth,dilatedMotionVectors,reconstructedPrevNearestDepth,output;
+ float jitterOffsetX,jitterOffsetY,motionVectorScaleX,motionVectorScaleY;
+ uint32_t renderWidth,renderHeight,upscaleWidth,upscaleHeight;
+ bool enableSharpening;float sharpness,frameTimeDelta,preExposure;bool reset;
+ float cameraNear,cameraFar,cameraFovAngleVertical,viewSpaceToMetersFactor;
+ uint32_t flags;
+};
+// No fixed-size assert on the outer struct here - the real total (tail scalar
+// fields past `output`) hasn't been independently confirmed yet, only the
+// resource-entry stride and field order above. sizeof(*d) is still logged
+// per-dispatch below so a wrong guess here would be caught immediately.
+// This offset IS independently confirmed (a real memory capture showed a
+// valid 2560x1440 resource landing exactly here) - assert it directly.
+static_assert(offsetof(Fsr3UpscalerDispatchDescription,output)==1592,"FSR3 output field position (this game's SDK build)");
+using Fsr3UpscalerDispatch=uint32_t(*)(void*,const Fsr3UpscalerDispatchDescription*);
+static Fsr3UpscalerDispatch original_fsr3upscaler{};
+// ffx_fsr3upscaler_x64.dll itself ships with no embedded version resource in
+// this game (module_file_version reads "unknown" for it live) - the 176-byte
+// named-resource layout above was instead confirmed against the FFX loader
+// dll that ships alongside it (amd_fidelityfx_dx12.dll), whose version IS
+// readable. Only trust the hardcoded layout - and only then feed captures
+// into HIP - when that companion dll matches the exact build this was
+// confirmed against; a different game or a different FFX SDK drop is not
+// guaranteed to share this same struct shape. fsr3_layout_matches() lives in
+// its own header so it stays testable on the host (see
+// linux/tests/test_fsr3_layout_gate.py) without pulling in D3D12/Windows.h.
+static std::atomic<bool>fsr3_layout_trusted{false};
+static uint32_t fsr3_upscaler_dispatch(void*ctx,const Fsr3UpscalerDispatchDescription*d){
+ if(!d)return original_fsr3upscaler(ctx,d);
+ unsigned n=++frames;log("fsr3upscaler_begin",d->commandList,nullptr,n);
+ if(n<=8){
+  AcquireSRWLockExclusive(&lock);
+  if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){
+   fprintf(f,"pid=%lu kind=fsr3upscaler_dispatch frame=%u list=%p color=%p output=%p out_size=%ux%u out_state=%u motion=%p render=%ux%u upscale=%ux%u reset=%u\n",
+    GetCurrentProcessId(),n,d->commandList,d->color.resource,d->output.resource,d->output.width,d->output.height,
+    d->output.state,d->motionVectors.resource,d->renderWidth,d->renderHeight,d->upscaleWidth,d->upscaleHeight,unsigned(d->reset));
+   fclose(f);
+  }ReleaseSRWLockExclusive(&lock);
+ }
+ auto result=original_fsr3upscaler(ctx,d);log("fsr3upscaler_end",d->commandList,nullptr,result);
+ if(NativeHipRequested()){
+  D3D12_RESOURCE_STATES live_state{};
+  const bool state_known=ffx_state_to_d3d12(d->output.state,live_state);
+  if(fsr3_route_to_live(fsr3_layout_trusted.load(),result==0,d->commandList,d->output.resource,state_known)&&
+     claim_live_route(live_route_owner,LiveRouteFsr3))
+   hip_live.Record(static_cast<ID3D12GraphicsCommandList*>(d->commandList),static_cast<ID3D12Resource*>(d->output.resource),live_state,n);
+ }
+ return result;
+}
 // XeSS titles (Rise of the Ronin): the same contract read from xessD3D12Execute's parameters (XeSS 1.x/2.x SDK layout)
 // instead of the FFX dispatch description. XeSS runs first; the network then refines its 1080p output after submission,
 // exactly as with FSR. Velocity is XeSS-scaled by (-w,-h) in this title, so the feed's motion sign is flipped.
@@ -431,7 +515,38 @@ static DWORD WINAPI worker(void*){
 #endif
  s=MH_CreateHook(reinterpret_cast<void*>(target),reinterpret_cast<void*>(&dispatch),reinterpret_cast<void**>(&original));if(s==MH_OK)s=MH_EnableHook(reinterpret_cast<void*>(target));
  // Do not retry an existing-hook conflict or modify another addon's hook.
- if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu hook_status=%u upscaler=%s\n",GetCurrentProcessId(),unsigned(s),module?"ffx":"xess");fclose(f);}return s==MH_OK?0:4;
+ wchar_t loader_ver[64]=L"unknown";if(module)module_file_version(module,loader_ver,64);
+ {if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu hook_status=%u upscaler=%s version=%ls\n",GetCurrentProcessId(),unsigned(s),module?"ffx":"xess",loader_ver);fclose(f);}}
+#ifdef NATIVE_ORDER_NEURAL
+ // Some titles (Cyberpunk 2077) call the older, non-unified FSR3 upscaler
+ // entry point directly rather than the unified ffxDispatch hooked above -
+ // hook that too. Independent and best-effort: never blocks or fails the
+ // primary hook, own log line, bounded poll in case it loads later.
+ {
+  HMODULE fsr3upscaler=nullptr;
+  for(unsigned i=0;!fsr3upscaler&&i<50;i++){fsr3upscaler=GetModuleHandleW(L"ffx_fsr3upscaler_x64.dll");if(!fsr3upscaler)Sleep(100);}
+  if(fsr3upscaler){
+   // ffx_fsr3upscaler_x64.dll carries no version resource of its own in this
+   // title; the FFX loader dll found above (amd_fidelityfx_dx12.dll et al.)
+   // is what the hardcoded 176-byte struct layout was actually confirmed
+   // against, so gate on its version instead.
+   fsr3_layout_trusted=module&&fsr3_layout_matches(loader_ver);
+   if(auto fsr3target=GetProcAddress(fsr3upscaler,"ffxFsr3UpscalerContextDispatch")){
+    auto fs=MH_CreateHook(reinterpret_cast<void*>(fsr3target),reinterpret_cast<void*>(&fsr3_upscaler_dispatch),
+     reinterpret_cast<void**>(&original_fsr3upscaler));
+    if(fs==MH_OK)fs=MH_EnableHook(reinterpret_cast<void*>(fsr3target));
+    if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){
+     fprintf(f,"pid=%lu hook_status=%u upscaler=fsr3upscaler loader_version=%ls layout_trusted=%u\n",GetCurrentProcessId(),unsigned(fs),loader_ver,unsigned(fsr3_layout_trusted.load()));fclose(f);
+    }
+   }else if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){
+    fprintf(f,"pid=%lu kind=fsr3upscaler_symbol_not_found loader_version=%ls\n",GetCurrentProcessId(),loader_ver);fclose(f);
+   }
+  }else if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){
+   fprintf(f,"pid=%lu kind=fsr3upscaler_dll_not_loaded_after_5s\n",GetCurrentProcessId());fclose(f);
+  }
+ }
+#endif
+ return s==MH_OK?0:4;
 }
 // Before the game creates its D3D12 device: select the private Agility 721 runtime shipped in
 // the game folder and enable the experimental shader-model feature so SM6.10 wave-matrix PSOs
