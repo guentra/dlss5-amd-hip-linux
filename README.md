@@ -1,6 +1,6 @@
 # DLSS5-AMD HIP for Linux
 
-> **It needs substantial optimization and is not ready for normal gameplay.** Expect very low frame rates (~15-20fps), high latency and possible rendering problems like ghosting and shimmering. It is not an official NVIDIA DLSS implementation or a claim of equivalent image quality.
+> **It needs substantial optimization and is not ready for normal gameplay.** Expect low frame rates (~20-25fps), high latency and possible rendering problems like ghosting and shimmering. It is not an official NVIDIA DLSS implementation or a claim of equivalent image quality.
 
 A native Linux HIP/rocWMMA implementation of the complete 71-block DLSS5 network for AMD `gfx1201`, with a ReShade add-on, Wine bridge and modified vkd3d-proton submission path. NVIDIA DLLs and weights are **not included**.
 
