@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 B=${DLSS5_GRAPH_TEST_BUILD:-linux/build/graph-audit}
 export DLSS5_GRAPH_TEST_BUILD="$B"
-ARCH="${ARCH:-gfx1201}"
+ARCH="${ARCH:-gfx1201,gfx1200}"
 if [[ -z "${ROCM_PATH:-}" && -n "${HIP_PATH:-}" ]]; then
   ROCM_PATH="$HIP_PATH"
 fi
@@ -35,7 +35,13 @@ if [[ -z "${ROCM_PATH:-}" ]]; then
   ROCM_PATH="$(dirname "$(dirname "$(readlink -f "$HIPCC" 2>/dev/null || printf '%s' "$HIPCC")")")"
 fi
 mkdir -p "$B"
-FLAGS=(--offload-arch="$ARCH" -O3 -std=c++17 -Ihip/include)
+OFFLOAD=()
+IFS=',' read -ra _archs <<< "$ARCH"
+for _arch in "${_archs[@]}"; do
+  _arch="${_arch// /}"
+  [[ -n "$_arch" ]] && OFFLOAD+=(--offload-arch="$_arch")
+done
+FLAGS=("${OFFLOAD[@]}" -O3 -std=c++17 -Ihip/include)
 if [[ -d "${ROCM_PATH}/include" ]]; then
   FLAGS+=(-I"${ROCM_PATH}/include")
 fi

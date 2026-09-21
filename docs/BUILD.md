@@ -12,7 +12,8 @@ game files, captures, caches and NVIDIA weights are excluded.
   skips those wrappers when a real prefix exists.
 - An x64 MinGW C compiler for the PE bridge (`dlss5_hip.dll`). Distro
   `x86_64-w64-mingw32-gcc` is enough; llvm-mingw is optional.
-- Default offload arch is `gfx1201`.
+- Default offload arches are `gfx1201` (RX 9070 XT) and `gfx1200` (RX 9060).
+  Each is its own code object. `make -C hip ARCH=gfx1201` builds only the 9070 XT.
 
 The Makefile does not bake in a home directory. It locates the toolchain itself.
 
@@ -38,6 +39,7 @@ Overrides:
 make -C hip HIPCC=/opt/rocm-7.14.0/bin/hipcc ROCM_PATH=/opt/rocm-7.14.0
 make -C hip MINGW_PREFIX=/opt/llvm-mingw game
 make -C hip ARCH=gfx1201
+make -C hip ARCH=gfx1201,gfx1200
 ```
 
 `make -C hip check` runs the GPU graph/API suites. If several HIP devices are

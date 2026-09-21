@@ -1,6 +1,13 @@
 # Override any of: HIPCC, ROCM_PATH, HIP_PATH, ARCH, MINGW_CC, MINGW_PREFIX, TOOLCHAIN_DIR.
-ARCH ?= gfx1201
+# ARCH is a comma-separated list. Each arch is a separate code object in the
+# fat binary; HIP loads the one matching the GPU. gfx1201 compiled alone and
+# gfx1201 inside ARCH=gfx1201,gfx1200 produce the same device .text.
+# ARCH=gfx1201 keeps a single-arch build for faster iteration.
+ARCH ?= gfx1201,gfx1200
 BUILD ?= build
+comma := ,
+ARCHES := $(subst $(comma), ,$(ARCH))
+OFFLOAD := $(foreach a,$(ARCHES),--offload-arch=$(a))
 
 # Prefer an explicit ROCm prefix over `hipcc` on PATH: pip/venv `rocm-sdk-core`
 # wrappers often shadow the device compiler. GNU make treats `)` as the end of
@@ -46,7 +53,7 @@ ifneq ($(ROCM_PATH),)
   INCLUDES += -I$(ROCM_PATH)/include
   LDFLAGS := -L$(ROCM_PATH)/lib -lamdhip64 -Wl,-rpath,$(ROCM_PATH)/lib
 endif
-CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES)
+CXXFLAGS := -O3 -std=c++17 $(OFFLOAD) $(INCLUDES)
 TESTS := test_wmma test_stages test_quantize test_attention test_residual test_linear test_logical_ops test_ffn_f32
 
 # Preference: explicit MINGW_PREFIX, then the self-contained llvm-mingw
