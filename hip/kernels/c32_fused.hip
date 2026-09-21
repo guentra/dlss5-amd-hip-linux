@@ -10,9 +10,7 @@ __device__ inline void c32_sync_window() { __syncthreads(); }
 __device__ inline void c32_wave_sync() { __syncthreads(); }
 } // namespace
 
-// QKV_ONCE computes the three K=32 projections from one A load, then normalizes.
-// The per-part MMA, the half-square RMS order, and the V quantize are unchanged.
-template <bool CHAIN, bool WINDOWED, bool WRITE_FFN, bool WRITE_OUT, bool QKV_ONCE = true>
+template <bool CHAIN, bool WINDOWED, bool WRITE_FFN, bool WRITE_OUT>
 __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8* ffn_w,
                                                     const float* ffn_s, const u8* qkv_w,
                                                     const float* qscale, const float* bias,
@@ -133,33 +131,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     }
     c32_sync_window();
 
-    auto store_qkv = [&](uint part, linalg::C32& q0, linalg::C32& q1) {
-        for (uint i = 0; i < q0.Length(); ++i) {
-            uint2 rc2 = q0.GetCoordinate(i);
-            raw[(first + rc2.x) * RAW_STRIDE + part * 32u + rc2.y] = q0.Get(i);
-            uint2 rc3 = q1.GetCoordinate(i);
-            raw[(first + rc3.x) * RAW_STRIDE + part * 32u + 16u + rc3.y] = q1.Get(i);
-        }
-    };
-    if constexpr (QKV_ONCE) {
-        using namespace linalg;
-        A8 a = A8::Load(ffn8 + first * 36u, 0, 36);
-        C32 q0 = C32::Splat(0.f), q1 = C32::Splat(0.f);
-        C32 k0a = C32::Splat(0.f), k1a = C32::Splat(0.f);
-        C32 v0a = C32::Splat(0.f), v1a = C32::Splat(0.f);
-        q0.MultiplyAccumulate(a, B8::LoadRowMajorOut(qkv_w, 0, 0, 32));
-        q1.MultiplyAccumulate(a, B8::LoadRowMajorOut(qkv_w, 16, 0, 32));
-        k0a.MultiplyAccumulate(a, B8::LoadRowMajorOut(qkv_w, 32, 0, 32));
-        k1a.MultiplyAccumulate(a, B8::LoadRowMajorOut(qkv_w, 48, 0, 32));
-        v0a.MultiplyAccumulate(a, B8::LoadRowMajorOut(qkv_w, 64, 0, 32));
-        v1a.MultiplyAccumulate(a, B8::LoadRowMajorOut(qkv_w, 80, 0, 32));
-        store_qkv(0, q0, q1);
-        store_qkv(1, k0a, k1a);
-        store_qkv(2, v0a, v1a);
-        c32_sync_window();
-    }
     for (uint part = 0; part < 3u; ++part) {
-        if constexpr (!QKV_ONCE) {
+        {
             using namespace linalg;
             A8 a = A8::Load(ffn8 + first * 36u, 0, 36);
             B8 b0 = B8::LoadRowMajorOut(qkv_w, part * 32u, 0, 32);
@@ -167,9 +140,14 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             C32 q0 = C32::Splat(0.f), q1 = C32::Splat(0.f);
             q0.MultiplyAccumulate(a, b0);
             q1.MultiplyAccumulate(a, b1);
-            store_qkv(part, q0, q1);
-            c32_sync_window();
+            for (uint i = 0; i < q0.Length(); ++i) {
+                uint2 rc2 = q0.GetCoordinate(i);
+                raw[(first + rc2.x) * RAW_STRIDE + part * 32u + rc2.y] = q0.Get(i);
+                uint2 rc3 = q1.GetCoordinate(i);
+                raw[(first + rc3.x) * RAW_STRIDE + part * 32u + 16u + rc3.y] = q1.Get(i);
+            }
         }
+        c32_sync_window();
         if (part < 2u) {
             if (lane < 16u) {
                 const uint row = first + lane;
@@ -209,8 +187,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                     packed[(128u + row) * 36u + c] = e4m3_byte_fast(raw[row * RAW_STRIDE + part * 32u + c]);
                 }
         }
-        if constexpr (!QKV_ONCE)
-            c32_sync_window();
+        c32_sync_window();
     }
     c32_sync_window();
 
