@@ -123,6 +123,104 @@ __global__ void k_vit_ffn_fused(const float* input, const u8* w_expand, const u8
     }
 }
 
+// One quarter of the fused FFN. blockIdx.y is the quarter 0..3. The contract
+// partial is the f32 accumulator only; the residual and the quarter adds stay
+// in k_vit_ffn_reduce so the order remains H(x*scale) + q0 + q1 + q2 + q3.
+__global__ void k_vit_ffn_quarter(const float* input, const u8* w_expand, const u8* w_contract,
+                                  float* partial, uint tokens) {
+    using namespace linalg;
+    constexpr uint CH = 1024u;
+    constexpr uint HSTRIDE = 1028u;
+    const uint tid = threadIdx.x;
+    const uint wave = tid / 32u;
+    const uint first = blockIdx.x * 16u;
+    const uint q = blockIdx.y;
+    __shared__ u8 Ast[16 * HSTRIDE];
+    __shared__ u8 hid[16 * HSTRIDE];
+    {
+        const uint row = tid / 32u;
+        const uint k0 = (tid % 32u) * 32u;
+        for (uint i = 0; i < 8u; i++) {
+            const uint kk = k0 + i * 4u;
+            const float4 v = *reinterpret_cast<const float4*>(input + (first + row) * CH + kk);
+            *reinterpret_cast<u32*>(Ast + row * HSTRIDE + kk) =
+                u32(e4m3_byte_fast(v.x)) | u32(e4m3_byte_fast(v.y)) << 8 |
+                u32(e4m3_byte_fast(v.z)) << 16 | u32(e4m3_byte_fast(v.w)) << 24;
+        }
+    }
+    __syncthreads();
+    C32 acc[4];
+    for (uint n = 0; n < 4u; n++)
+        acc[n] = C32::Splat(0.f);
+    for (uint g = 0; g < 32u; g++) {
+        A8 a = A8::Load(Ast, g * 32u, HSTRIDE);
+        for (uint n = 0; n < 4u; n++) {
+            const uint col = wave * 64u + n * 16u;
+            B8 b = B8::LoadRow(w_expand, ((q * 64u + (col >> 4u)) * 32u + g) * 512u, 16);
+            acc[n].MultiplyAccumulate(a, b);
+        }
+    }
+    for (uint n = 0; n < 4u; n++) {
+        const uint col = wave * 64u + n * 16u;
+        for (uint i = 0; i < acc[n].Length(); i++) {
+            uint2 rc = acc[n].GetCoordinate(i);
+            hid[rc.x * HSTRIDE + col + rc.y] = e4m3_byte_fast(ActivatePoly(acc[n].Get(i)));
+        }
+    }
+    __syncthreads();
+    C32 part[4];
+    for (uint n = 0; n < 4u; n++)
+        part[n] = C32::Splat(0.f);
+    for (uint g = 0; g < 32u; g++) {
+        A8 a = A8::Load(hid, g * 32u, HSTRIDE);
+        for (uint n = 0; n < 4u; n++) {
+            const uint col = wave * 64u + n * 16u;
+            B8 b = B8::LoadRow(w_contract, (((col >> 4u) * 128u + q * 32u + g) * 512u), 16);
+            part[n].MultiplyAccumulate(a, b);
+        }
+    }
+    const uint stride = tokens * CH;
+    for (uint n = 0; n < 4u; n++) {
+        const uint col = wave * 64u + n * 16u;
+        for (uint i = 0; i < part[n].Length(); i++) {
+            uint2 rc = part[n].GetCoordinate(i);
+            partial[(q * stride) + (first + rc.x) * CH + col + rc.y] = part[n].Get(i);
+        }
+    }
+}
+
+__global__ void k_vit_ffn_reduce(const float* input, const float* scales, const float* partial,
+                                 float* output, uint tokens) {
+    constexpr uint CH = 1024u;
+    uint i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    uint n4 = (tokens * CH) >> 2;
+    if (i4 >= n4)
+        return;
+    uint elem = i4 << 2;
+    uint ch = elem % CH;
+    float4 x = *reinterpret_cast<const float4*>(input + elem);
+    float4 s = *reinterpret_cast<const float4*>(scales + ch);
+    float4 v;
+    v.x = H(x.x * s.x);
+    v.y = H(x.y * s.y);
+    v.z = H(x.z * s.z);
+    v.w = H(x.w * s.w);
+    const uint n = tokens * CH;
+    for (uint q = 0; q < 4u; q++) {
+        float4 p = *reinterpret_cast<const float4*>(partial + q * n + elem);
+        v.x += p.x;
+        v.y += p.y;
+        v.z += p.z;
+        v.w += p.w;
+    }
+    float4 o;
+    o.x = from_e4m3(e4m3_byte_fast(H(v.x)));
+    o.y = from_e4m3(e4m3_byte_fast(H(v.y)));
+    o.z = from_e4m3(e4m3_byte_fast(H(v.z)));
+    o.w = from_e4m3(e4m3_byte_fast(H(v.w)));
+    *reinterpret_cast<float4*>(output + elem) = o;
+}
+
 __global__ void k_vit_gather(const u8* src, const int* map, u8* dst, uint tokens, uint src_c,
                               uint dst_c) {
     uint t = blockIdx.x * blockDim.x + threadIdx.x;

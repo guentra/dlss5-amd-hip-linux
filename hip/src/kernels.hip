@@ -383,12 +383,28 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
 }
 
 
+static bool vit_ffn_lds() {
+    const char* e = std::getenv("DLSS5_VIT_FFN_LDS");
+    return e && e[0] == '1' && e[1] == '\0';
+}
 void launch_vit_ffn_fused(const float* in, const u8* w_expand, const u8* w_contract,
-                          const float* scales, float* out, uint tokens) {
-    if (!tokens || tokens % 16 || !in || !w_expand || !w_contract || !scales || !out ||
-        in == out)
+                          const float* scales, float* out, uint tokens, float* partial) {
+    if (!tokens || tokens % 16 || tokens % 4 || !in || !w_expand || !w_contract || !scales ||
+        !out || in == out)
         throw std::runtime_error("vit ffn extent/alias");
-    LAUNCH(k_vit_ffn_fused, tokens / 16u, 512, in, w_expand, w_contract, scales, out);
+    // Four quarter CTAs (160 at 640 tokens) so every CU gets work. The f32
+    // quarter partials are added in order by k_vit_ffn_reduce.
+    // DLSS5_VIT_FFN_LDS=1 keeps the single 16-wave CTA.
+    if (vit_ffn_lds())
+        LAUNCH(k_vit_ffn_fused, tokens / 16u, 512, in, w_expand, w_contract, scales, out);
+    else {
+        if (!partial || partial == in || partial == out)
+            throw std::runtime_error("vit ffn partial buffer");
+        LAUNCH(k_vit_ffn_quarter, dim3(tokens / 16u, 4u), 512, in, w_expand, w_contract, partial,
+               tokens);
+        LAUNCH(k_vit_ffn_reduce, ((tokens * 1024u / 4u) + 255u) / 256u, 256, in, scales, partial, out,
+               tokens);
+    }
 }
 
 void launch_ffn(int c, const u8* in, const u8* w, u8* out, uint tokens) {

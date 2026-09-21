@@ -89,7 +89,7 @@ void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint
 void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, float* out, uint tokens,
                     bool chain_residual = false, bool precise_c32 = false);
 void launch_vit_ffn_fused(const float* in, const u8* w_expand, const u8* w_contract,
-                          const float* scales, float* out, uint tokens);
+                          const float* scales, float* out, uint tokens, float* partial = nullptr);
 
 void launch_ffn(int c, const u8* in, const u8* w, u8* out, uint tokens);
 void launch_qkv(int c, const u8* in, const u8* w, u8* out, uint tokens);

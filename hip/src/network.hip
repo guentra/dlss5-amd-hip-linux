@@ -260,7 +260,7 @@ struct Vit {
     // with the 4096-byte hidden rows kept in LDS. DLSS5_VIT_FFN_SPLIT=1 forces the
     // legacy two-launch path for debugging.
     if(!(std::getenv("DLSS5_VIT_FFN_SPLIT") && std::string(std::getenv("DLSS5_VIT_FFN_SPLIT")) == "1")){
-     launch_vit_ffn_fused(in,ex.as<u8>(),ct.as<u8>(),cs.as<float>(),s.b.as<float>(),640);
+     launch_vit_ffn_fused(in,ex.as<u8>(),ct.as<u8>(),cs.as<float>(),s.b.as<float>(),640,s.hidden.as<float>());
     }else{
     // The expand output is already on the E4M3 grid; keeping the bytes lets the
     // contract GEMM consume them directly (e4m3_byte(from_e4m3(q)) == q).
