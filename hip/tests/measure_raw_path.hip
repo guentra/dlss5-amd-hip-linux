@@ -3,6 +3,11 @@
 // This is the exact in-game critical-path segment: the vkd3d submit worker is
 // blocked for this duration between prefix and suffix.
 // usage: measure_raw_path <weights_dir> [frames] [dxgi_format]
+// Commit comparisons use the defaults and the printed "best wall" only:
+//   measure_raw_path <weights>     (1 warmup + 5 frames, DXGI 87 BGRA8)
+//   DLSS5_TEMPORAL_BLEND unset, HIP device 0, real weights, gfx1201.
+// A longer frame count changes the minimum. hip-network70 gpu_ms is a
+// different clock and is not this number.
 #include "dlss5_capi.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
