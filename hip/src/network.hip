@@ -334,7 +334,9 @@ struct Network70::Impl {
      launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
    }
   launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
-   blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false);
+    // Block 0's f16 raster sibling is dead: skip[0] comes from the f16 window
+    // (reframe below) and the pool overwrites s.out16 before anything reads it.
+    blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false,true,false);
    // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
    launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
@@ -343,8 +345,14 @@ struct Network70::Impl {
   const __half* group_in_h=s.out16.as<__half>();
    for(int g=0;g<5;++g){
    const u8* in_f8=nullptr; const __half* in_h=group_in_h;
-   for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
-   hip_check(hipMemcpyAsync(skip[g+1].p,src,size_t(w)*h*c*4,hipMemcpyDeviceToDevice,stream),"encoder skip");
+    for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];
+     // A c32 group's last block publishes the f32 raster (pool/skip read it); its
+     // f16 raster sibling has no consumer, so skip the scattered write.
+     b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false,!(b.c==32&&j+1==num[g]));std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
+    // Kernel copy instead of hipMemcpyAsync: bit-identical (pure byte move),
+    // keeps the skip path on the same launch stream/queue as the kernels and
+    // avoids the driver copy-engine submission.
+    launch_copy_f32(src,skip[g+1].as<float>(),size_t(w)*h*c*4);
     uint ow=g==4?32:w/2,oh=g==4?20:h/2;
      if(g<4){launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin_out(s.a16.as<__half>(),ds[g].as<__half>(),nullptr,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);}
      else{launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin_out(s.a16.as<__half>(),head_w.as<__half>(),dst,nullptr,ow*oh,c*2,c,1,1,0);}
@@ -359,7 +367,10 @@ struct Network70::Impl {
    const int decfirst[]={40,48,56,62,66},decnum[]={8,8,6,4,4};
    for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),nullptr,s,s.out16.as<__half>());std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
     const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h;
-    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
+    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];
+     // Same dead f16 raster sibling as the encoder group: only the f32 raster
+     // (post_merge's low input) is consumed after the last c32 block.
+     b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false,!(b.c==32&&j+1==decnum[g]));std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
   launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),dst,s.out16.as<__half>(),W,Ht,true);std::swap(src,dst);
   // block 70 publishes only the f16 sibling: the f32 raster write of post_merge and
   // the reframe were dead traffic (block 70 reads the f16 chain, the head reads the

@@ -655,8 +655,11 @@ void launch_up_f32(const float* lo,const float* skip,const float* scale,float* o
 void launch_up_f32_h(const float* lo,const float* skip,const float* scale,float* out,__half* out_h,uint iw,uint ih,uint ow,uint oh,uint c){
   if(!iw||!ih||ow>2*iw||oh>2*ih||out==lo||out==skip||!out_h)throw std::runtime_error("upsample f16 geometry/alias");LAUNCH(k_up_f32,(ow*oh*c+255)/256,256,lo,skip,scale,out,iw,ow,oh,c,out_h);
 }
-void launch_post_merge_f32(const float* lo,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low);}
-void launch_post_merge_f32_h(const float* lo,const float* pre,const float* scales,float* out,__half* out_h,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low,out_h);}
+void launch_copy_f32(const float* src,float* dst,size_t bytes){
+  if(bytes%16)return;LAUNCH(k_copy_f32,(uint)((bytes/16+255u)/256u),256,src,dst,(uint)(bytes/16));
+}
+void launch_post_merge_f32(const float* lo,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32/8+255)/256,256,lo,pre,scales,out,w,h,main8_low);}
+void launch_post_merge_f32_h(const float* lo,const float* pre,const float* scales,float* out,__half* out_h,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32/8+255)/256,256,lo,pre,scales,out,w,h,main8_low,out_h);}
 void launch_head_f32(const float* in,const float* w,const float* color,float* out,uint n){LAUNCH(k_head_f32,(n+63)/64,64,in,w,color,out,n);}
 // The head reads block 70's windowed f16 output directly: block 70's values sit on
 // the f16 grid (H() round), so the f16 read is bit-identical to the f32 raster

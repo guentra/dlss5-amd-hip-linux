@@ -148,6 +148,7 @@ void launch_rgb_graph(const float*,float*,float*,uint w,uint h,uint ow,uint oh);
 void launch_gather_f32(const float*,const int*,float*,uint n);
 void launch_up_f32(const float*,const float*,const float*,float*,uint iw,uint ih,uint ow,uint oh,uint c);
 void launch_up_f32_h(const float*,const float*,const float*,float*,__half*,uint iw,uint ih,uint ow,uint oh,uint c);
+void launch_copy_f32(const float* src,float* dst,size_t bytes);
 void launch_post_merge_f32(const float*,const float*,const float*,float*,uint w,uint h,bool main8_low = false);
 void launch_post_merge_f32_h(const float*,const float*,const float*,float*,__half*,uint w,uint h,bool main8_low);
 void launch_head_f32(const float*,const float*,const float*,float*,uint n);

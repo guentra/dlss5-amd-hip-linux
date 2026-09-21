@@ -441,6 +441,14 @@ __global__ void k_reframe_hin_hout(const __half* src, __half* dst, uint w, uint 
     *reinterpret_cast<uint2*>(dst + (win * 64u + tok) * c + ch) = v;
 }
 
+// 16B vectorized device copy. The driver's hipMemcpyAsync D2D path runs at
+// ~150GB/s on gfx1201 (copy engine), a plain kernel hits HBM bandwidth.
+__global__ void k_copy_f32(const float* src, float* dst, uint n4) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n4)
+        reinterpret_cast<float4*>(dst)[i] = reinterpret_cast<const float4*>(src)[i];
+}
+
 __global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh,
                            __half* dst_h = nullptr) {
     uint i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -567,13 +575,48 @@ __global__ void k_up_f32(const float* lo,const float* skip,const float* scale,fl
 // v ends on the f16 grid (outer H round). When the f16 sibling is published
 // (out_h != null) the f32 write is pure traffic: no consumer reads it (block 70
 // takes the f16 path, the head reads the f16 raster), so skip it.
+// Eight channels per thread: the 32-wide pixel rows stay 16B-aligned, so the
+// f16 publish is one 16B store and every input load is 16B (the 1-channel
+// version paid read-modify-write on sub-cache-line accesses).
 __global__ void k_post_merge_f32(const float* low,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low = false,__half* out_h=nullptr){
-  uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=w*h*32)return;
-  uint ch=i%32,p=i/32,lp=((p/w)/2)*(w/2)+(p%w)/2;
-  float lo=main8_low?from_e4m3(e4m3_byte(low[lp*32+ch])):low[lp*32+ch];
-  float v=H(H(lo*scales[ch])+from_e4m3(e4m3_byte(pre[i]))*scales[32+ch]);
-  if(!out_h)out[i]=v;
-  if(out_h)out_h[i]=__float2half_rn(v);
+  uint i8=(blockIdx.x*blockDim.x+threadIdx.x)*8u;if(i8+8u>w*h*32u)return;
+  uint ch=i8&31u,p=i8/32u,lp=((p/w)/2u)*(w/2u)+(p%w)/2u;
+  const float* lo_ptr=low+lp*32u+ch;
+  float4 lo0,lo1;
+  if(main8_low){
+    lo0=make_float4(from_e4m3(e4m3_byte(lo_ptr[0])),from_e4m3(e4m3_byte(lo_ptr[1])),
+                    from_e4m3(e4m3_byte(lo_ptr[2])),from_e4m3(e4m3_byte(lo_ptr[3])));
+    lo1=make_float4(from_e4m3(e4m3_byte(lo_ptr[4])),from_e4m3(e4m3_byte(lo_ptr[5])),
+                    from_e4m3(e4m3_byte(lo_ptr[6])),from_e4m3(e4m3_byte(lo_ptr[7])));
+  }else{
+    lo0=*reinterpret_cast<const float4*>(lo_ptr);
+    lo1=*reinterpret_cast<const float4*>(lo_ptr+4);
+  }
+  float4 pr0=*reinterpret_cast<const float4*>(pre+i8);
+  float4 pr1=*reinterpret_cast<const float4*>(pre+i8+4);
+  float4 v0,v1;
+  v0.x=H(H(lo0.x*scales[ch])+from_e4m3(e4m3_byte(pr0.x))*scales[32u+ch]);
+  v0.y=H(H(lo0.y*scales[ch+1u])+from_e4m3(e4m3_byte(pr0.y))*scales[32u+ch+1u]);
+  v0.z=H(H(lo0.z*scales[ch+2u])+from_e4m3(e4m3_byte(pr0.z))*scales[32u+ch+2u]);
+  v0.w=H(H(lo0.w*scales[ch+3u])+from_e4m3(e4m3_byte(pr0.w))*scales[32u+ch+3u]);
+  v1.x=H(H(lo1.x*scales[ch+4u])+from_e4m3(e4m3_byte(pr1.x))*scales[32u+ch+4u]);
+  v1.y=H(H(lo1.y*scales[ch+5u])+from_e4m3(e4m3_byte(pr1.y))*scales[32u+ch+5u]);
+  v1.z=H(H(lo1.z*scales[ch+6u])+from_e4m3(e4m3_byte(pr1.z))*scales[32u+ch+6u]);
+  v1.w=H(H(lo1.w*scales[ch+7u])+from_e4m3(e4m3_byte(pr1.w))*scales[32u+ch+7u]);
+  if(!out_h){
+    *reinterpret_cast<float4*>(out+i8)=v0;
+    *reinterpret_cast<float4*>(out+i8+4)=v1;
+  }
+  if(out_h){
+    __half2 h0=__floats2half2_rn(v0.x,v0.y),h1=__floats2half2_rn(v0.z,v0.w),
+            h2=__floats2half2_rn(v1.x,v1.y),h3=__floats2half2_rn(v1.z,v1.w);
+    uint4 o;
+    o.x=*reinterpret_cast<const uint*>(&h0);
+    o.y=*reinterpret_cast<const uint*>(&h1);
+    o.z=*reinterpret_cast<const uint*>(&h2);
+    o.w=*reinterpret_cast<const uint*>(&h3);
+    *reinterpret_cast<uint4*>(out_h+i8)=o;
+  }
 }
 // Head over block 70's windowed f16 output: same (px,py)-shifted win/tok remap as
 // k_reframe_f32<HIN>; the values are f16-exact, so this is bit-identical to
