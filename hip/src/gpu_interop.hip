@@ -368,49 +368,70 @@ void launch_rgb_to_pix(const float* rgb, const uint8_t* alpha_src, uint8_t* out,
 }
 
 // Temporal blend (shimmer fix): cur = (1-w)*cur + w*prev over n floats, GPU-resident.
-// w in [0,1); w=0 is skipped (no launch). See k_gc_temporal_blend for the contract.
-void launch_temporal_blend(float* cur, const float* prev, int n, float w) {
+// w in [0,1); w=0 is skipped (no launch). skip_if_set = previous frame's guard flag
+// (device): nonzero skips the blend (a bypassed frame is never mixed in).
+void launch_temporal_blend(float* cur, const float* prev, int n, float w, const unsigned* skip_if_set) {
   if (w <= 0.f) return;
   const int block = 256;
   const int grid = (n + block - 1) / block;
-  k_gc_temporal_blend<<<grid, block, 0, raw_stream()>>>(cur, prev, n, w);
+  k_gc_temporal_blend<<<grid, block, 0, raw_stream()>>>(cur, prev, n, w, skip_if_set);
   hip_check(hipGetLastError(), "launch temporal blend");
 }
 
 // Gated temporal blend: w/lo/hi contract of k_gc_temporal_blend_gated; requires lo < hi.
-void launch_temporal_blend_gated(float* cur, const float* prev, int n, float w, float lo, float hi) {
+// skip_if_set as in launch_temporal_blend.
+void launch_temporal_blend_gated(float* cur, const float* prev, int n, float w, float lo, float hi,
+                                 const unsigned* skip_if_set) {
   if (w <= 0.f || hi <= lo) return;
   const int block = 256;
   const int grid = (n + block - 1) / block;
-  k_gc_temporal_blend_gated<<<grid, block, 0, raw_stream()>>>(cur, prev, n, w, lo, hi);
+  k_gc_temporal_blend_gated<<<grid, block, 0, raw_stream()>>>(cur, prev, n, w, lo, hi, skip_if_set);
   hip_check(hipGetLastError(), "launch gated temporal blend");
 }
 
-// Guards the 1920x1080 RGB result: non-finite (all formats) or non-representable as
-// half (rgba16_float), mirroring the CPU pre-passes that bypass the whole frame.
-bool guard_result_f32(const float* dev, size_t n, bool need_half_repr) {
-  DeviceBuf flag(4);
-  hip_check(hipMemset(flag.p, 0, 4), "guard alloc");
-  if (need_half_repr) {
-    k_gc_prescan_rgb16f<<<(int)((n + kBlock - 1) / kBlock), kBlock, 0, raw_stream()>>>(dev, int(n), flag.as<unsigned>());
-  } else {
-    k_gc_prescan_f32<<<(int)((n + kBlock - 1) / kBlock), kBlock, 0, raw_stream()>>>(dev, int(n), flag.as<unsigned>());
+// Whole-frame guard prescan, GPU-resident: writes nonzero to *flag (device, 4 bytes,
+// pre-allocated and caller-owned) when the frame must be bypassed. input_prescan=true
+// is the 16-bit input pre-pass (n = number of 16-bit elements, rgba16_float only);
+// false is the output guard (n = number of RGB floats: non-finite, plus not
+// representable as half for rgba16_float). No readback: the commit kernel consumes
+// the flag on device.
+void launch_guard_prescan(const void* dev, size_t n, unsigned dxgi_format, bool input_prescan, unsigned* flag) {
+  if (input_prescan) {  // only the 16-bit input has a pre-pass (bit-exact CPU contract)
+    k_gc_prescan16<<<(int)((n + kBlock - 1) / kBlock), kBlock, 0, raw_stream()>>>((const uint16_t*)dev, int(n), flag);
+    hip_check(hipGetLastError(), "guard prescan16 launch");
+    return;
   }
-  hip_check(hipGetLastError(), "guard launch");
-  unsigned host = 0;
-  hip_check(hipMemcpy(&host, flag.p, 4, hipMemcpyDeviceToHost), "guard read");
-  return host != 0;
+  if (format_from_dxgi(dxgi_format) == FmtRgba16F) {
+    k_gc_prescan_rgb16f<<<(int)((n + kBlock - 1) / kBlock), kBlock, 0, raw_stream()>>>((const float*)dev, int(n), flag);
+  } else {
+    k_gc_prescan_f32<<<(int)((n + kBlock - 1) / kBlock), kBlock, 0, raw_stream()>>>((const float*)dev, int(n), flag);
+  }
+  hip_check(hipGetLastError(), "guard prescan launch");
 }
 
-bool input16_bad(const uint8_t* dev, size_t n16) {
-  DeviceBuf flag(4);
-  hip_check(hipMemset(flag.p, 0, 4), "guard alloc");
-  k_gc_prescan16<<<(int)((n16 + kBlock - 1) / kBlock), kBlock, 0, raw_stream()>>>((const uint16_t*)dev, int(n16),
-                                                                            flag.as<unsigned>());
-  hip_check(hipGetLastError(), "guard launch");
-  unsigned host = 0;
-  hip_check(hipMemcpy(&host, flag.p, 4, hipMemcpyDeviceToHost), "guard read");
-  return host != 0;
+// Final write stage + GPU-resident bypass (k_gc_commit): *bad nonzero copies the input
+// pixel bytes bit-exact (the old CPU bypass was a whole-buffer D2D copy), otherwise
+// converts the decoded RGB exactly like launch_rgb_to_pix.
+void launch_commit(const float* rgb, const uint8_t* pix_in, uint8_t* pix_out, int w, int h, unsigned dxgi_format,
+                   const unsigned* bad) {
+  const dim3 blk(kBlock, kBlock, 1);
+  switch (format_from_dxgi(dxgi_format)) {
+    case FmtRgba8:
+      k_gc_commit<FmtRgba8><<<grid_for(w, h), blk, 0, raw_stream()>>>(rgb, w, h, pix_in, pix_out, bad);
+      break;
+    case FmtBgra8:
+      k_gc_commit<FmtBgra8><<<grid_for(w, h), blk, 0, raw_stream()>>>(rgb, w, h, pix_in, pix_out, bad);
+      break;
+    case FmtR16Unorm:
+      k_gc_commit<FmtR16Unorm><<<grid_for(w, h), blk, 0, raw_stream()>>>(rgb, w, h, pix_in, pix_out, bad);
+      break;
+    case FmtRgba16F:
+      k_gc_commit<FmtRgba16F><<<grid_for(w, h), blk, 0, raw_stream()>>>(rgb, w, h, pix_in, pix_out, bad);
+      break;
+    default:
+      throw std::runtime_error("unsupported dxgi format for gpu commit");
+  }
+  hip_check(hipGetLastError(), "launch commit");
 }
 
 }  // namespace gpu

@@ -139,7 +139,7 @@ static int run_blend_case(){
  gcur.upload(hcur,size_t(n)*4);
  gprev.upload(hprev,size_t(n)*4);
  std::vector<float> gout(n);
- launch_temporal_blend_gated(gcur.as<float>(),gprev.as<float>(),n,w,lo,hi);
+ launch_temporal_blend_gated(gcur.as<float>(),gprev.as<float>(),n,w,lo,hi,nullptr);
  hipStreamSynchronize(nullptr);
  gcur.download(gout.data(),size_t(n)*4);
  for(int i=0;i<n;++i){
@@ -154,7 +154,7 @@ static int run_blend_case(){
    }
  }
  gcur.upload(hcur,size_t(n)*4);
- launch_temporal_blend(gcur.as<float>(),gprev.as<float>(),n,w);
+ launch_temporal_blend(gcur.as<float>(),gprev.as<float>(),n,w,nullptr);
  hipStreamSynchronize(nullptr);
  gcur.download(gout.data(),size_t(n)*4);
  for(int i=0;i<n;++i){

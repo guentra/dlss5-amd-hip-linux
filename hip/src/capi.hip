@@ -58,12 +58,24 @@ struct FrameBuffers {
     // Temporal blend (shimmer fix): previous-frame decoded 1920x1080 RGB, plus the
     // continuity tokens that reset it (geometry gen, add-on F6 temporal gen).
     dlss5::DeviceBuf prev_out;
-    bool prev_valid=false;
     dlss5_u32 prev_handle_gen=0;
     dlss5_u32 prev_temporal_gen=0;
     bool prev_seeded=false;
+    // GPU-resident whole-frame guard flags, one per frame parity (4 device bytes each,
+    // nonzero = bypass). The prescan of frame N writes flag[N%2]; the blend and the
+    // commit of frame N+1 read flag[N%2]. Alternating parity keeps the two frames'
+    // flags apart with no CPU state, so the bypass decision never touches the host.
+    dlss5::DeviceBuf guard_a, guard_b;
+    int raw_parity=0;
+    // Cross-stream ordering: default stream (encode) -> network stream -> default
+    // stream (decode/commit). Records on the producer side, waits on the consumer.
+    hipEvent_t ev_net_in{}, ev_net_out{};
     dlss5_u32 previous_flags=0;
     float previous_white=0;
+    ~FrameBuffers() {
+        if (ev_net_in) (void)hipEventDestroy(ev_net_in);
+        if (ev_net_out) (void)hipEventDestroy(ev_net_out);
+    }
     void create() {
         const size_t n=1920ull*1080, padded=1920ull*1152;
         // neural must hold the network's full 1920x1152 RGB output; only the first
@@ -71,6 +83,14 @@ struct FrameBuffers {
         source.alloc(n*16);proxy.alloc(n*16);neural.alloc(padded*12);decoded.alloc(n*12);history.alloc(n*12);
         prev_out.alloc(n*12);
         warped.alloc(padded*16);base.alloc(padded*16);
+        guard_a.alloc(4);guard_b.alloc(4);
+        // 0xff = "bad": the first frame never blends, and the first commit is a
+        // no-op if its own prescan has not run (it always does, but a missing
+        // prescan must fail safe to the bit-exact input copy, never to garbage).
+        dlss5::hip_check(hipMemsetAsync(guard_a.p,0xff,4,nullptr),"guard init a");
+        dlss5::hip_check(hipMemsetAsync(guard_b.p,0xff,4,nullptr),"guard init b");
+        dlss5::hip_check(hipEventCreate(&ev_net_in),"network in event");
+        dlss5::hip_check(hipEventCreate(&ev_net_out),"network out event");
         host_proxy.resize(n*4);host_neural.resize(padded*3);host_warped.resize(padded*4);host_result.resize(n*3);
     }
 };
@@ -357,10 +377,22 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         auto& b=*g_frame;
         // Reset the temporal blend when the geometry generation or the add-on's
         // continuity token (F6 bypass generation) changes, or on the first frame.
-        if (!b.prev_seeded||f->handle_gen!=b.prev_handle_gen||f->temporal_gen!=b.prev_temporal_gen)
-            b.prev_valid=false;
+        // The blend is gated by the previous frame's GPU guard flag, so a reset is
+        // "mark the previous flag bad" (the blend kernel skips; prev_out reseeds).
+        const bool blend_reset=!b.prev_seeded||f->handle_gen!=b.prev_handle_gen||f->temporal_gen!=b.prev_temporal_gen;
         b.prev_seeded=true;b.prev_handle_gen=f->handle_gen;b.prev_temporal_gen=f->temporal_gen;
         const float blend_w=float(temporal_blend_weight());
+        // Alternating parity for the GPU guard flags: frame N owns flag[N%2] (its
+        // prescans write it) and reads flag[(N-1)%2] (the previous frame's verdict).
+        b.raw_parity^=1;
+        const bool pa=b.raw_parity==0;
+        unsigned* flag=pa?(unsigned*)b.guard_a.p:(unsigned*)b.guard_b.p;
+        const unsigned* flag_prev=pa?(const unsigned*)b.guard_b.p:(const unsigned*)b.guard_a.p;
+        if (blend_reset)
+            dlss5::hip_check(hipMemsetAsync((void*)flag_prev,0xff,4,nullptr),"guard reset");
+        // The prescans only ever write 1 (bad); this frame's flag must start clean
+        // (the 0xff create() init is for the blend gate, not for the prescan).
+        dlss5::hip_check(hipMemsetAsync((void*)flag,0,4,nullptr),"guard clear");
         const bool dev_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_DEV_PTRS)!=0;
         const bool host_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_HOST_PTRS)!=0;
         const size_t bytes=size_t(f->width)*f->height*((f->dxgi_format==28||f->dxgi_format==87)?4u:8u);
@@ -384,61 +416,68 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
             if (!dlss5::gpu::map_device(f->out_handle,bytes,f->handle_gen,&dev_out)) throw std::runtime_error("cannot import output handle");
         }
         const auto fmt=dlss5::gpu::format_from_dxgi(f->dxgi_format);
-        auto bypass=[&]() {
-            // CPU bypass semantics: keep the original pixels, alpha exact. A bypassed
-            // frame is not a network output: invalidate the blend history so the next
-            // frame does not mix with a stale (or non-network) previous frame.
-            b.prev_valid=false;
-            if (host_ptrs) {std::memcpy(f->out_handle,f->in_handle,bytes);}
-            else {
-                dlss5::hip_check(hipMemcpy(dev_out,dev_in,bytes,hipMemcpyDeviceToDevice),"bypass copy");
-                dlss5::hip_check(hipStreamSynchronize(nullptr),"bypass sync");
-            }
-            g_err.clear();return 0;
-        };
         b.history_valid=false;b.previous_flags=f->flags&1u;b.previous_white=f->paper_white;
         dlss5::FrameSettings settings{f->paper_white,f->transfer,f->color,(f->flags&1u)!=0};
-        if (fmt==dlss5::gpu::FmtRgba16F && dlss5::gpu::input16_bad((const uint8_t*)dev_in,size_t(f->width)*f->height*4))
-            return bypass();
+        // Input pre-pass (16-bit only, bit-exact CPU contract): non-finite input sets
+        // the guard flag on device. The commit below makes the bypass decision with
+        // no CPU readback — the network still runs in this degenerate case (wasteful
+        // there only), but out remains a bit-exact copy of in.
+        if (fmt==dlss5::gpu::FmtRgba16F)
+            dlss5::gpu::launch_guard_prescan((const void*)dev_in,size_t(f->width)*f->height*4,f->dxgi_format,true,flag);
         dlss5::gpu::launch_px_to_rgba((const uint8_t*)dev_in,b.source.as<float>(),f->width,f->height,f->dxgi_format);
         ft.mark("conv_in");
         dlss5::frame_encode(b.source.as<float>(),b.proxy.as<float>(),1920,1080,settings,nullptr);
         ft.mark("encode");
-        g_net->run_gpu_gpu(b.proxy.as<float>(),b.neural.as<float>(),f->seed,nullptr);
+        // Cross-stream ordering with no CPU wait: encode (default stream) ->
+        // network (own stream, via ev_net_in) -> decode/commit (default, via
+        // ev_net_out). Fixes the latent race where the network could read the
+        // encode proxy before the encode stream reached it.
+        dlss5::hip_check(hipEventRecord(b.ev_net_in,nullptr),"encode event");
+        g_net->run_gpu_gpu_async(b.proxy.as<float>(),b.neural.as<float>(),f->seed,nullptr,b.ev_net_in,b.ev_net_out);
         ft.mark("net");
+        dlss5::hip_check(hipStreamWaitEvent(nullptr,b.ev_net_out,0),"net event wait");
         dlss5::frame_decode(b.source.as<float>(),b.proxy.as<float>(),b.neural.as<float>(),b.decoded.as<float>(),1920,1080,settings,nullptr);
         ft.mark("decode");
-        dlss5::hip_check(hipStreamSynchronize(nullptr),"raw frame gpu");
-        ft.mark("sync");
-        if (dlss5::gpu::guard_result_f32(b.decoded.as<float>(),n*3,fmt==dlss5::gpu::FmtRgba16F))
-            return bypass();
+        // Output guard: scan the decoded RGB and write the same device flag.
+        dlss5::gpu::launch_guard_prescan(b.decoded.as<float>(),n*3,f->dxgi_format,false,flag);
+        ft.mark("guard");
         // Temporal blend (shimmer fix + ghosting gate): the live path is non-temporal
         // (history reset every frame), so the network amplifies the input's per-frame
         // micro-variation into visible shimmer. Mixing in the previous frame's decoded
         // RGB low-passes that variation. w=blend_w is the previous-frame weight (0
         // disables it). The gate keeps the blend only where the frames agree, so
-        // moving content passes through untouched instead of trailing a ghost.
+        // moving content passes through untouched instead of trailing a ghost. The
+        // previous frame's flag skips the blend when it bypassed (same semantics as
+        // the old CPU prev_valid token).
         if (blend_w>0.f) {
             const size_t bn=n*3;
             const TemporalBlendGate gate=temporal_blend_gate();
-            if (b.prev_valid) {
-                if (gate.enabled)
-                    dlss5::gpu::launch_temporal_blend_gated(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w,gate.lo,gate.hi);
-                else
-                    dlss5::gpu::launch_temporal_blend(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w);
-                dlss5::hip_check(hipMemcpy(b.prev_out.p,b.decoded.p,bn*4,hipMemcpyDeviceToDevice),"blend prev update");
-            } else {
-                dlss5::hip_check(hipMemcpy(b.prev_out.p,b.decoded.p,bn*4,hipMemcpyDeviceToDevice),"blend prev init");
-            }
-            b.prev_valid=true;
+            if (gate.enabled)
+                dlss5::gpu::launch_temporal_blend_gated(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w,gate.lo,gate.hi,flag_prev);
+            else
+                dlss5::gpu::launch_temporal_blend(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w,flag_prev);
+            // Unconditional prev update (seeds the next frame even when this blend is
+            // gated; a gated prev's content is never consumed because its flag is bad).
+            // Kernel copy: same bytes as the old hipMemcpy D2D, stays in-stream.
+            dlss5::launch_copy_f32(b.decoded.as<float>(),b.prev_out.as<float>(),bn*4);
         }
-        dlss5::gpu::launch_rgb_to_pix(b.decoded.as<float>(),(const uint8_t*)dev_in,(uint8_t*)dev_out,f->width,f->height,f->dxgi_format);
+        // Final write stage + GPU-resident bypass: flag nonzero copies the input
+        // bytes bit-exact (the old CPU bypass), otherwise converts the decoded RGB.
+        // Replaces the 4-byte D2H guard readback and the CPU branch: the ABI never
+        // conveyed the decision to the caller, so it never needed to be on the host.
+        dlss5::gpu::launch_commit(b.decoded.as<float>(),(const uint8_t*)dev_in,(uint8_t*)dev_out,f->width,f->height,f->dxgi_format,flag);
         ft.mark("conv_out");
+        // Single completion point for the whole frame. The network stream is joined
+        // via ev_net_out above; everything else runs on the default stream.
         dlss5::hip_check(hipStreamSynchronize(nullptr),"raw frame out");
         if (host_ptrs) dlss5::hip_check(hipMemcpy(f->out_handle,dev_out,bytes,hipMemcpyDeviceToHost),"raw output d2h");
         ft.mark("sync_out");
         g_err.clear();return 0;
-    } catch(const std::exception&e) {if(g_frame)g_frame->prev_valid=false;set_err(e.what());return -1;}
+    } catch(const std::exception&e) {
+        // Fail safe: mark both parities "bad" so the next frame skips its blend and
+        // its commit degrades to the bit-exact input copy.
+        if(g_frame){(void)hipMemsetAsync(g_frame->guard_a.p,0xff,4,nullptr);(void)hipMemsetAsync(g_frame->guard_b.p,0xff,4,nullptr);}
+        set_err(e.what());return -1;}
 }
 
 __attribute__((constructor)) static void dlss5_hip_publish(void) {

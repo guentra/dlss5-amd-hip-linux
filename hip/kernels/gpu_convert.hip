@@ -181,6 +181,31 @@ __global__ void k_gc_rgb_to_pix(const float* __restrict__ rgb, int w, int h,
                     out + (size_t(y) * w + x) * BPP);
 }
 
+// Final write stage with a GPU-resident bypass decision. *bad nonzero (any frame guard
+// fired): the pixel is a bit-exact copy of the input bytes (the old CPU-side bypass was
+// a whole-buffer D2D copy); otherwise gc_rgb_to_px runs exactly as k_gc_rgb_to_pix.
+// Replaces the 4-byte D2H guard readback + CPU branch: the caller never learns the
+// decision (the ABI returns 0 either way), so it never needed to.
+template <int FMT>
+__global__ void k_gc_commit(const float* __restrict__ rgb, int w, int h,
+                            const uint8_t* __restrict__ pix_in, uint8_t* __restrict__ pix_out,
+                            const unsigned* __restrict__ bad) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  constexpr int BPP = (FMT == FmtRgba8 || FMT == FmtBgra8) ? 4 : 8;
+  const uint8_t* in = pix_in + (size_t(y) * w + x) * BPP;
+  uint8_t* out = pix_out + (size_t(y) * w + x) * BPP;
+  if (bad && *bad) {
+    const uint32_t* i4 = reinterpret_cast<const uint32_t*>(in);
+    uint32_t* o4 = reinterpret_cast<uint32_t*>(out);
+    o4[0] = i4[0];
+    if (BPP == 8) o4[1] = i4[1];
+    return;
+  }
+  gc_rgb_to_px<FMT>(rgb, w, h, x, y, in, out);
+}
+
 // Whole-frame guards mirroring the CPU pre-passes:
 //  - prescan16: rgba16_float input rejected if any half is inf/NaN (all 4 channels).
 //  - prescan_f32: output rejected if any float is non-finite.
@@ -203,11 +228,15 @@ __global__ void k_gc_prescan_rgb16f(const float* __restrict__ p, int n, unsigned
 
 // Temporal blend (shimmer fix for the non-temporal live path): cur = (1-w)*cur + w*prev
 // elementwise over n floats. w is the previous-frame weight in [0,1); w=0 is a no-op.
+// *skip_if_set (device flag of the PREVIOUS frame) nonzero: cur is untouched, keeping
+// the GPU-resident bypass semantics (a bypassed frame is never mixed into the blend).
 // This is a post-network smoothing stage, intentionally outside the 71-block bit-exact
 // contract (it only runs on the in-game raw path, never in the offline bench).
-__global__ void k_gc_temporal_blend(float* __restrict__ cur, const float* __restrict__ prev, int n, float w) {
+__global__ void k_gc_temporal_blend(float* __restrict__ cur, const float* __restrict__ prev, int n, float w,
+                                    const unsigned* __restrict__ skip_if_set) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) {
+    if (skip_if_set && *skip_if_set) return;
     const float c = cur[i], p = prev[i];
     cur[i] = (1.f - w) * c + w * p;
   }
@@ -219,9 +248,11 @@ __global__ void k_gc_temporal_blend(float* __restrict__ cur, const float* __rest
 // trail) while static regions keep the shimmer fix; the residual ghost is bounded
 // because the unblended frame becomes the next frame's history.
 __global__ void k_gc_temporal_blend_gated(float* __restrict__ cur, const float* __restrict__ prev, int n,
-                                          float w, float lo, float hi) {
+                                          float w, float lo, float hi,
+                                          const unsigned* __restrict__ skip_if_set) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) {
+    if (skip_if_set && *skip_if_set) return;
     const float c = cur[i], p = prev[i];
     const float d = fabsf(c - p);
     const float g = fminf(fmaxf((hi - d) * (1.f / (hi - lo)), 0.f), 1.f);

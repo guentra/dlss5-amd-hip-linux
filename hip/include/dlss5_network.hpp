@@ -29,6 +29,15 @@ struct Network70 {
     // No H2D input upload and no D2H output download: the network stays on the GPU.
     // Bit-identical to run_gpu() for the same input bytes.
     void run_gpu_gpu(const float* dev_rgb, float* dev_out, uint seed, const float* host_history = nullptr);
+    // Non-blocking variant: enqueues the whole network on the internal stream and
+    // returns once the launches are queued (no internal hipStreamSynchronize).
+    // wait_event (non-null): the network stream first waits on it, ordering this run
+    // after whatever produced the input (e.g. frame_encode on the default stream).
+    // signal_event (non-null): recorded on the network stream after the last kernel,
+    // so the caller's stream can wait on it before consuming dev_out. The caller owns
+    // both events and must synchronize the stream(s) itself.
+    void run_gpu_gpu_async(const float* dev_rgb, float* dev_out, uint seed, const float* host_history,
+                           hipEvent_t wait_event, hipEvent_t signal_event);
     float last_gpu_ms() const;
     struct Trace { uint elements{}, nonfinite{}, hash{}; float minimum{}, maximum{}; double sum{}; bool checked{}; };
     std::array<uint,71> last_block_counts() const;

@@ -311,7 +311,8 @@ struct Network70::Impl {
   s.create();trace_stats.alloc(71*256*3*4);trace_bits.alloc(71*256*2*4);
   hip_check(hipStreamCreate(&stream),"network stream");hip_check(hipEventCreate(&ev0),"network event0");hip_check(hipEventCreate(&ev1),"network event1");ready=true;
  }
-  void run(const float* input,float* output,uint seed,const float* host_history,bool input_on_gpu,bool output_on_gpu=false){
+   void run(const float* input,float* output,uint seed,const float* host_history,bool input_on_gpu,bool output_on_gpu=false,
+            hipEvent_t wait_event=nullptr,hipEvent_t signal_event=nullptr){
     if(!ready||!input||!output)throw std::runtime_error("network not ready/null buffers");
   StreamScope scope(stream);bool tracing=std::getenv("DLSS5_HIP_TRACE")&&std::string(std::getenv("DLSS5_HIP_TRACE"))!="0";
   if(host_history){
@@ -324,12 +325,15 @@ struct Network70::Impl {
     if(id==bid&&count){std::vector<float> v(count);hip_check(hipMemcpyAsync(v.data(),data,count*4,hipMemcpyDeviceToHost,stream),"dump");
      const char* tag=getenv("DLSS5_DUMP_TAG")?getenv("DLSS5_DUMP_TAG"):"x";
      FILE* fp=fopen(((std::string("/tmp/opencode/dump_b")+std::to_string(bid)+"_")+tag+".bin").c_str(),"wb");if(fp){std::fwrite(v.data(),4,count,fp);fclose(fp);}}}};
-   if(input_on_gpu){
-     // Input is already a device buffer (the frame_encode proxy). Use it directly —
-     // no H2D upload. Bit-identical to the host path: the upload was a raw copy.
-     hip_check(hipEventRecord(ev0,stream),"start");
-     launch_rgb_graph(input,color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
-   }else{
+    if(input_on_gpu){
+      // Input is already a device buffer (the frame_encode proxy). Use it directly —
+      // no H2D upload. Bit-identical to the host path: the upload was a raw copy.
+      // wait_event orders this stream after the (other) stream that wrote the input;
+      // without it the device has no dependency on the encode stream (latent race).
+      if(wait_event)hip_check(hipStreamWaitEvent(stream,wait_event,0),"network input wait");
+      hip_check(hipEventRecord(ev0,stream),"start");
+      launch_rgb_graph(input,color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
+    }else{
      hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
      launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
    }
@@ -377,9 +381,18 @@ struct Network70::Impl {
   // f16 window output; both are f16-exact). Tracing still materializes the f32 raster.
   blocks[70].run(src,tracing?dst:nullptr,s,nullptr,false,s.out16.as<__half>(),false,true,false,false);std::swap(src,dst);mark(70,src,N*32);
   launch_head_f16(s.ah.as<__half>(),head_rgb.as<float>(),color.as<float>(),out.as<float>(),W,Ht,blocks[70].sw,blocks[70].sh,blocks[70].px,blocks[70].py);
-   hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
-   if(output_on_gpu){if(output!=out.p)hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToDevice,stream),"output d2d");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}
-   else{hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}
+    hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
+    if(signal_event){
+      // Non-blocking: completion is signaled via the caller's event; no sync here.
+      // The network always writes the internal out buffer; when the caller asked for
+      // a different device buffer, copy it device-side (same as the blocking path,
+      // minus the synchronize) before signaling completion.
+      if(output!=out.p)hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToDevice,stream),"output d2d");
+      hip_check(hipEventRecord(signal_event,stream),"network signal");
+      // gpu_ms is left stale: the timing events are still pending at return time
+      // (hipEventElapsedTime would report device-not-ready).
+    }else if(output_on_gpu){if(output!=out.p)hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToDevice,stream),"output d2d");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}
+    else{hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}
   if(tracing){std::vector<float> stats(71*768);std::vector<uint> bits(71*512);trace_stats.download(stats.data(),stats.size()*4);trace_bits.download(bits.data(),bits.size()*4);
    bool bad=false;for(int b=0;b<71;++b){auto&t=trace[b];t.minimum=INFINITY;t.maximum=-INFINITY;t.checked=true;
     for(int l=0;l<256;++l){t.minimum=std::min(t.minimum,stats[b*768+l*3]);t.maximum=std::max(t.maximum,stats[b*768+l*3+1]);t.sum+=stats[b*768+l*3+2];t.nonfinite+=bits[b*512+l*2];t.hash^=bits[b*512+l*2+1];}
@@ -393,7 +406,8 @@ Network70::~Network70()=default;
 void Network70::create(const std::string&dir){auto next=std::make_unique<Impl>();next->create(dir);impl.swap(next);}
 void Network70::run(const float* in,float* out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(in,out,seed,host_history,false);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
  void Network70::run_gpu(const float* dev,float* out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(dev,out,seed,host_history,true,false);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
- void Network70::run_gpu_gpu(const float* dev_in,float* dev_out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(dev_in,dev_out,seed,host_history,true,true);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
+  void Network70::run_gpu_gpu(const float* dev_in,float* dev_out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(dev_in,dev_out,seed,host_history,true,true);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
+  void Network70::run_gpu_gpu_async(const float* dev_in,float* dev_out,uint seed,const float* host_history,hipEvent_t wait_event,hipEvent_t signal_event){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(dev_in,dev_out,seed,host_history,true,false,wait_event,signal_event);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
 float Network70::last_gpu_ms()const{return impl->gpu_ms;}
 std::array<uint,71> Network70::last_block_counts()const{return impl->counts;}
 std::array<Network70::Trace,71> Network70::last_trace()const{return impl->trace;}
