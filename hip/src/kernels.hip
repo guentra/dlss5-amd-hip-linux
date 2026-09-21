@@ -1,5 +1,6 @@
 #include "dlss5_runtime.hpp"
 #include "dlss5_launch.hpp"
+#include <cstdlib>
 #include "../kernels/ffn_fused.hip"
 #include "../kernels/qkv.hip"
 #include "../kernels/qkv_norm.hip"
@@ -541,20 +542,33 @@ void launch_split_ffwd(const u8* in, const u8* pre, const u8* expand, const u8* 
                        uint tokens) {
     LAUNCH(k_split_ffwd, tokens / 16, 32, in, pre, expand, contract, out, tokens);
 }
+static bool vit_attn_split() {
+    const char* e = std::getenv("DLSS5_VIT_ATTN_SPLIT");
+    return e && e[0] == '1' && e[1] == '\0';
+}
 void launch_vit_attention(const float* qkv, u8* out, uint tokens, uint dim) {
     if (tokens % 16 || dim % 32)
         throw std::runtime_error("vit attention extent");
-    LAUNCH((k_vit_attention<false>), dim3(tokens / 16, dim / 32), 32, qkv, nullptr, out, tokens,
-           dim);
+    // Fused path: 1 wave, 32-key LDS tile. DLSS5_VIT_ATTN_SPLIT=1 keeps the
+    // full-matrix kernel (14.7KB, 4 CTAs/CU) for A/B.
+    if (vit_attn_split())
+        LAUNCH((k_vit_attention<false>), dim3(tokens / 16, dim / 32), 32, qkv, nullptr, out, tokens,
+               dim);
+    else
+        LAUNCH((k_vit_attention_fused<false>), dim3(tokens / 16, dim / 32), 32, qkv, nullptr, out,
+               tokens, dim);
 }
 void launch_vit_attention_f8(const u8* qkv_f8, u8* out, uint tokens, uint dim) {
     if (tokens % 16 || dim % 32)
         throw std::runtime_error("vit attention extent");
-    // 64 threads (2 waves/CTA): the 16B staging loop steps by blockDim.x/8 so it still
-    // covers all rows. 1 wave + 15.7KB LDS capped occupancy at 4 waves/CU; 2 waves/CTA
-    // roughly doubles it. Byte-exact (same staged bytes, same MMA/denom order).
-    LAUNCH((k_vit_attention<true>), dim3(tokens / 16, dim / 32), 64, nullptr, qkv_f8, out, tokens,
-            dim);
+    if (vit_attn_split())
+        // 64 threads: staging covers every row (step blockDim.x/8). Both waves
+        // execute the MMA; kept only as the split fallback.
+        LAUNCH((k_vit_attention<true>), dim3(tokens / 16, dim / 32), 64, nullptr, qkv_f8, out,
+               tokens, dim);
+    else
+        LAUNCH((k_vit_attention_fused<true>), dim3(tokens / 16, dim / 32), 32, nullptr, qkv_f8, out,
+               tokens, dim);
 }
 void launch_post70_merge(const u8* main, const u8* skip, const float* scales, u8* dst, uint n,
                          uint c) {

@@ -109,9 +109,36 @@ __global__ void k_split_ffwd(const u8* in, const u8* pre, const u8* expand, cons
     }
 }
 
+// Stage one head-row of Q, K or V as E4M3 bytes. Out-of-range keys store 0
+// so a partial 32-key tail (tokens % 32 != 0) matches the padded MMA.
+template <bool F8IN>
+__device__ void vit_stage_e4m3(u8* tile, uint rows, const float* qkv, const u8* qkv_f8,
+                                uint token0, uint tokens, uint stride, uint col_base) {
+    const uint col = (threadIdx.x % 8u) * 4u;
+    for (uint r = threadIdx.x / 8u; r < rows; r += blockDim.x / 8u) {
+        const uint tok = token0 + r;
+        u32 packed = 0u;
+        if (tok < tokens) {
+            if constexpr (F8IN) {
+                packed = *reinterpret_cast<const u32*>(qkv_f8 + tok * stride + col_base + col);
+            } else {
+                const float4 v = *reinterpret_cast<const float4*>(qkv + tok * stride + col_base + col);
+                packed = u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                         u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            }
+        }
+        *reinterpret_cast<u32*>(tile + r * 32u + col) = packed;
+    }
+}
+
 // HLSL native_wave_vit_attention_fp8: bit-map exponents, unquantized
 // denominator, FP8 exponents for PV, normalize only AFTER the value product.
 // qkv is logical interleaved [token][3*dim], already normalized to the FP8 grid.
+//
+// The split kernel keeps every key's probability byte live (16*656 B) and is
+// the DLSS5_VIT_ATTN_SPLIT=1 fallback. The default kernel scores one 32-key
+// tile, adds that tile into the strict f32 denominator (key order 0..tokens-1,
+// 1.f/denom — not norm_inverse), then multiplies it into PV before the next tile.
 template <bool F8IN = false>
 __global__ void k_vit_attention(const float* qkv, const u8* qkv_f8, u8* out, uint tokens,
                                 uint dim) {
@@ -216,6 +243,79 @@ __global__ void k_vit_attention(const float* qkv, const u8* qkv_f8, u8* out, uin
         __syncthreads();
         A8 p = A8::Load(probabilities, k0, 656);
         B8 v0 = B8::LoadRow(values, 0, 32), v1 = B8::LoadRow(values, 16, 32);
+        acc0.MultiplyAccumulate(p, v0);
+        acc1.MultiplyAccumulate(p, v1);
+        __syncthreads();
+    }
+    for (uint i = 0; i < acc0.Length(); ++i) {
+        uint2 rc = acc0.GetCoordinate(i);
+        const float inv = 1.f / denom[rc.x];
+        out[(q0 + rc.x) * dim + head * 32 + rc.y] = e4m3_byte(H(acc0.Get(i) * inv));
+        out[(q0 + rc.x) * dim + head * 32 + 16 + rc.y] = e4m3_byte(H(acc1.Get(i) * inv));
+    }
+}
+
+// One wave. LDS is a 32-key working set, not the full 640-key probability matrix:
+//   [0,512)     Q/K tile, then the 32x32 V tile (V is staged only after ex is consumed)
+//   [512,1568)  ex as the exact f16 bits of the f32 exponent (0 outside the token range)
+//   [1568,2080) P tile, stride 32, 16-byte aligned rows for A8::Load
+//   [2080,2144) denom
+// Peak 2144 B. V reuses [0,1024) only after the f32 denom chain has read ex.
+template <bool F8IN>
+__global__ void k_vit_attention_fused(const float* qkv, const u8* qkv_f8, u8* out, uint tokens,
+                                      uint dim) {
+    using namespace linalg;
+    constexpr uint kExBytes = 16u * 33u * 2u;
+    constexpr uint kPrefix = 512u + kExBytes;
+    constexpr uint kPstride = 32u;
+    __shared__ alignas(16) u8 smem[kPrefix + 16u * kPstride + 16u * 4u];
+    u8* tile = smem;
+    uint16_t* ex = reinterpret_cast<uint16_t*>(smem + 512u);
+    u8* ptile = smem + kPrefix;
+    float* denom = reinterpret_cast<float*>(smem + kPrefix + 16u * kPstride);
+
+    const uint q0 = blockIdx.x * 16u, head = blockIdx.y;
+    const uint stride = 3u * dim;
+    const uint qbase = head * 32u;
+    const uint kbase = dim + qbase;
+    const uint vbase = 2u * dim + qbase;
+
+    vit_stage_e4m3<F8IN>(tile, 16u, qkv, qkv_f8, q0, tokens, stride, qbase);
+    if (threadIdx.x < 16u) denom[threadIdx.x] = 0.f;
+    __syncthreads();
+    A8 q = A8::Load(tile, 0, 32);
+    C32 acc0 = C32::Splat(0.f), acc1 = C32::Splat(0.f);
+    for (uint k0 = 0; k0 < tokens; k0 += 32) {
+        for (uint half = 0; half < 2; ++half) {
+            vit_stage_e4m3<F8IN>(tile, 16u, qkv, qkv_f8, k0 + half * 16u, tokens, stride, kbase);
+            __syncthreads();
+            B8 k = B8::LoadCol(tile, 0, 32);
+            C32 score = Multiply(q, k);
+            for (uint i = 0; i < score.Length(); ++i) {
+                uint2 rc = score.GetCoordinate(i);
+                const uint key = k0 + half * 16u + rc.y;
+                float affine = fminf(fmaxf(fmaf(score.Get(i),
+                    __half2float(__ushort_as_half(0x2dbb)), 1.708984375f), 1.439453125f),
+                                     1.9775390625f);
+                uint bits = __half_as_ushort(__float2half_rn(affine));
+                uint16_t hb = uint16_t((bits << 4) + 0x4000u);
+                float e = key < tokens ? __half2float(__ushort_as_half(hb)) : 0.f;
+                ex[rc.x * 33u + half * 16u + rc.y] = key < tokens ? hb : uint16_t(0);
+                ptile[rc.x * kPstride + half * 16u + rc.y] = e4m3_byte(e);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x < 16u) {
+#pragma unroll
+            for (uint j = 0; j < 32; ++j)
+                denom[threadIdx.x] += __half2float(__ushort_as_half(ex[threadIdx.x * 33u + j]));
+        }
+        // ex has been reduced in key order. V may now reuse the front of smem.
+        __syncthreads();
+        vit_stage_e4m3<F8IN>(tile, 32u, qkv, qkv_f8, k0, tokens, stride, vbase);
+        __syncthreads();
+        A8 p = A8::Load(ptile, 0, kPstride);
+        B8 v0 = B8::LoadRow(tile, 0, 32), v1 = B8::LoadRow(tile, 16, 32);
         acc0.MultiplyAccumulate(p, v0);
         acc1.MultiplyAccumulate(p, v1);
         __syncthreads();
