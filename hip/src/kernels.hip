@@ -106,10 +106,19 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
     LAUNCH(k_normalize_qkv, (count + 255) / 256, 256, in, scales, out, tokens, c, qgain, half_squares);
 }
 
+static bool vit_qkv_split() {
+    const char* e = std::getenv("DLSS5_VIT_QKV_SPLIT");
+    return e && e[0] == '1' && e[1] == '\0';
+}
 void launch_qkv_norm_half(const float* in, const __half* w, u8* out, uint m, const float* scales,
                           float qgain) {
     if (!m || !in || !w || !out || !scales) throw std::runtime_error("ViT QKV extent/scales");
-    LAUNCH(k_vit_qkv_norm, dim3((m + 15) / 16, 96u), 64, in, w, out, m, scales, qgain);
+    // One CTA owns Q+K+V of one head, so the f16 input tile is staged once.
+    // DLSS5_VIT_QKV_SPLIT=1 restores one CTA per Q/K/V part.
+    if (vit_qkv_split())
+        LAUNCH(k_vit_qkv_norm, dim3((m + 15) / 16, 96u), 64, in, w, out, m, scales, qgain);
+    else
+        LAUNCH(k_vit_qkv_norm_fused, dim3((m + 15) / 16, 32u), 64, in, w, out, m, scales, qgain);
 }
 
 // GEMM + normalize + quantize in one launch (bit-identical to the split pair).
