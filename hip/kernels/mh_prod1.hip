@@ -622,7 +622,7 @@ DEV void mh_ffn_qkv_body(const float*in,const float*w,unsigned char*out,uint tok
  #else
   for(uint e=0;e<8;e++)pack(a,e,load_in(first+rc,k+group*8+e));
  #endif
-  for(uint tile=0;tile<4;tile++){uint row=wave*64+tile*16+rc,offset=(row*C+k+group*8)/4;i2 b{};if constexpr(Frag)b=frag_b(reinterpret_cast<const unsigned char*>(w),row,C,k,group);else if constexpr(Tiled){const unsigned char*wb=reinterpret_cast<const unsigned char*>(w);uint off=((row/16)*(C/32)+k/32)*512+(k%32+group*8)*16+row%16;for(uint e=0;e<8;e++)b[e/4]=int(uint(b[e/4])|(uint(wb[off+e*16])<<(8*(e%4))));}else b={int(pw[offset]),int(pw[offset+1])};if(k==0&&wave==0&&dbg_st)__builtin_memcpy(dbg_st+16*(4*C+4)+tile*256+l*8,&a,8);if(k==0&&wave==0&&dbg_st)__builtin_memcpy(dbg_st+16*(4*C+4)+1024+tile*256+l*8,&b,8);expand[tile]=__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a,b,expand[tile]);}
+  for(uint tile=0;tile<4;tile++){uint row=wave*64+tile*16+rc,offset=(row*C+k+group*8)/4;i2 b{};if constexpr(Frag)b=frag_b(reinterpret_cast<const unsigned char*>(w),row,C,k,group);else if constexpr(Tiled)b=frag_b(reinterpret_cast<const unsigned char*>(w),row,C,k,group);else b={int(pw[offset]),int(pw[offset+1])};if(k==0&&wave==0&&dbg_st)__builtin_memcpy(dbg_st+16*(4*C+4)+tile*256+l*8,&a,8);if(k==0&&wave==0&&dbg_st)__builtin_memcpy(dbg_st+16*(4*C+4)+1024+tile*256+l*8,&b,8);expand[tile]=__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a,b,expand[tile]);}
   }
   if(dbg_ex)for(uint tile=0;tile<4;tile++)for(uint e=0;e<8;e++)dbg_ex[(first+group*8+e)*4*C+wave*64+tile*16+rc]=expand[tile][e];
   #if HIP_FFN_COOP_INPUT
@@ -651,7 +651,7 @@ DEV void mh_ffn_qkv_body(const float*in,const float*w,unsigned char*out,uint tok
   __builtin_amdgcn_fence(3,"workgroup");__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(2,"workgroup");
   f8 accum{};
  const uint first_k=Grouped?(wave/2)*128:0,last_k=Grouped?first_k+128:4*C;
- for(uint k=first_k;k<last_k;k+=16){i2 a;__builtin_memcpy(&a,hidden+rc*(4*C+4)+k+group*8,8);uint offset=4*C*C+((wave*16+rc)*(4*C)+k+group*8)/4;i2 b{};if constexpr(Frag)b=frag_b(reinterpret_cast<const unsigned char*>(w+4*C*C),wave*16+rc,4*C,k,group);else if constexpr(Tiled){const unsigned char*wb=reinterpret_cast<const unsigned char*>(w+4*C*C);uint row=wave*16+rc,off=((row/16)*(4*C/32)+k/32)*512+(k%32+group*8)*16+row%16;for(uint e=0;e<8;e++)b[e/4]=int(uint(b[e/4])|(uint(wb[off+e*16])<<(8*(e%4))));}else b={int(pw[offset]),int(pw[offset+1])};accum=__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a,b,accum);}
+ for(uint k=first_k;k<last_k;k+=16){i2 a;__builtin_memcpy(&a,hidden+rc*(4*C+4)+k+group*8,8);uint offset=4*C*C+((wave*16+rc)*(4*C)+k+group*8)/4;i2 b{};if constexpr(Frag)b=frag_b(reinterpret_cast<const unsigned char*>(w+4*C*C),wave*16+rc,4*C,k,group);else if constexpr(Tiled)b=frag_b(reinterpret_cast<const unsigned char*>(w+4*C*C),wave*16+rc,4*C,k,group);else b={int(pw[offset]),int(pw[offset+1])};accum=__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a,b,accum);}
   if constexpr(Project){
     __builtin_amdgcn_fence(3,"workgroup");__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(2,"workgroup");
     for(uint e=0;e<8;e++){unsigned char db=static_cast<unsigned char>(q8_fused_round(accum[e]));hidden[(group*8+e)*(C+4)+wave*16+rc]=db;if(dbg_d)dbg_d[(first+group*8+e)*C+wave*16+rc]=db;}

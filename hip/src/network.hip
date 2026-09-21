@@ -84,6 +84,9 @@ struct Block {
        // p0 stays row-major. C64/C128 read all three row-major.
        pack_tiled_e4m3(reinterpret_cast<u8*>(fmh.data()),f32.data(),4*c,c);
        pack_tiled_e4m3(reinterpret_cast<u8*>(fmh.data())+16*m,f32.data()+4*m,c,4*c);
+       // C256 expand/contract B fragments are 8 contiguous bytes (frag_b), not 8 stride-16 gathers.
+       permute_tiled_tiles_to_frag(reinterpret_cast<u8*>(fmh.data()),4*m);
+       permute_tiled_tiles_to_frag(reinterpret_cast<u8*>(fmh.data())+16*m,4*m);
        pk(fmh,32*m,f32.data()+8*m,m);
       }else{
        pk(fmh,0,f32.data(),4*m);

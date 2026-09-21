@@ -114,6 +114,8 @@ int main(int argc, char** argv) {
             // C256 prod FFN kernel reads expand/contract as 16x32 e4m3 tiles; p0 row-major.
             pack_tiled_e4m3(b, src, 4 * c, c);
             pack_tiled_e4m3(b + 16 * CC, src + 4 * CC, c, 4 * c);
+            permute_tiled_tiles_to_frag(b, 4 * CC);
+            permute_tiled_tiles_to_frag(b + 16 * CC, 4 * CC);
         } else {
             for (size_t i = 0; i < 4 * CC; i++) b[i] = e4m3_byte(src[i]);
             for (size_t i = 0; i < 4 * CC; i++) b[16 * CC + i] = e4m3_byte(src[4 * CC + i]);

@@ -204,4 +204,21 @@ inline void pack_tiled_e4m3(u8* dst, const float* src, size_t N, size_t K) {
                         e4m3_byte(src[(t * 16 + j) * K + g * 32 + k]);
 }
 
+// Within each 512-byte tile, pack the 8 K-bytes of one B fragment contiguously.
+// Same bytes the C256 tiled gather reads at stride 16 (k = half*16+group*8+e).
+inline void permute_tiled_tiles_to_frag(u8* bytes, size_t nbytes) {
+    for (size_t base = 0; base < nbytes; base += 512) {
+        u8 tmp[512];
+        for (int half = 0; half < 2; ++half)
+            for (int group = 0; group < 2; ++group)
+                for (int j = 0; j < 16; ++j)
+                    for (int e = 0; e < 8; ++e) {
+                        int k = half * 16 + group * 8 + e;
+                        tmp[((half * 2 + group) * 16 + j) * 8 + e] = bytes[base + k * 16 + j];
+                    }
+        for (int i = 0; i < 512; ++i)
+            bytes[base + i] = tmp[i];
+    }
+}
+
 } // namespace dlss5
