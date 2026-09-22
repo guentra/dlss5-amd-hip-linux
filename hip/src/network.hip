@@ -420,7 +420,11 @@ struct Network70::Impl {
       else up[g].run(src,skip[5-g].as<float>(),nullptr,s,s.out16.as<__half>());
       std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
      const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h; bool c32_in8=false;
-     for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;
+      for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];
+      // The group's last block feeds the next group's HIN downsample (f32 only);
+      // its e4m3 raster has no consumer, so skip it (the MH path would otherwise
+      // re-run the whole attention+projection pass to write that raster).
+      bool emit_f8=!b.raw&&b.c>=64&&j+1<decnum[g];bool emit_h=b.c==32;
       bool write_f32=tracing||(b.c!=32&&j+1==decnum[g]);
       const bool keep_win=write_f32||(b.c==32&&j+1==decnum[g]);
       const bool rf16=!(b.c==32&&j+1==decnum[g]);
