@@ -140,6 +140,9 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                 u32(e4m3_byte_fast(__half2float(__high2half(hp[1])))) << 24;
         }
     }
+    // Barrier 1 of 4: the prologue scatters each wave's 16 tokens across all
+    // four row groups (tok = (tid + it*128) / 8), so the FFN expand below
+    // reads input rows written by the other waves.
     c32_sync_window();
 
     {
@@ -158,7 +161,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                     e4m3_byte_fast(ActivatePolyC32(ex.Get(i)));
         }
     }
-    c32_sync_window();
+    // No barrier: the contract below reads hidden (wave-owned rows) and in16
+    // (published by barrier 1); same-wave LDS order covers the rest.
 
     linalg::C32 acc0 = linalg::C32::Splat(0.f), acc1 = linalg::C32::Splat(0.f);
 #pragma unroll
@@ -186,6 +190,9 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         acc0.MultiplyAccumulate(a, b0);
         acc1.MultiplyAccumulate(a, b1);
     }
+    // Barrier 2 of 4: the ffn8 stores below alias the packed K/V bytes that
+    // in16 (stride 34 half, tokens 33-63) still occupies; every wave's
+    // contract reads of in16 must complete before any ffn8 store.
     c32_sync_window();
 
     __half saved0[8], saved1[8];
@@ -203,7 +210,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         if constexpr (WRITE_FFN)
             ffn_h[(window * 64u + row) * 32u + 16u + rc3.y] = saved1[i];
     }
-    c32_sync_window();
+    // No barrier: the QKV GEMM reads ffn8 rows owned by the same wave; the
+    // per-wave ffn8 chunks are disjoint.
 
     for (uint part = 0; part < 3u; ++part) {
         {
@@ -221,7 +229,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                 raw[(first + rc3.x) * RAW_STRIDE + part * 32u + 16u + rc3.y] = q1.Get(i);
             }
         }
-        c32_sync_window();
+        // No barrier: the normalizer reads raw rows owned by the same wave.
         if (part < 2u) {
             if (lane < 16u) {
                 const uint row = first + lane;
@@ -261,9 +269,11 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                     packed[(128u + row) * 36u + c] = e4m3_byte_fast(raw[row * RAW_STRIDE + part * 32u + c]);
                 }
         }
-        c32_sync_window();
+        // No barrier: the next part's GEMM reads ffn8 chunks owned by the
+        // same wave; Q/K/V stores alias only rows consumed after barrier 3.
     }
-    // One barrier: QK below reads K and V rows written by the other waves.
+    // Barrier 3 of 4: QK below reads all K rows and PV reads all V rows,
+    // each published by every wave's normalizer.
     c32_sync_window();
 
     {
@@ -282,7 +292,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             }
         }
     }
-    c32_sync_window();
+    // No barrier: the row sum reads scores rows owned by the same wave.
 
     uint4 p8r[4];
     if (lane < 16u) {
@@ -308,6 +318,9 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             p8r[q4] = v;
         }
     }
+    // Barrier 4 of 4: p8 rows stride 64 B into the 136 B scores rows, so a
+    // wave's p8 stores overlap the previous wave's not-yet-summed scores
+    // rows; every row sum must finish before any p8 store.
     c32_sync_window();
     if (lane < 16u) {
         const uint qi = first + lane;
@@ -316,8 +329,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         for (uint q4 = 0; q4 < 4u; ++q4)
             row[q4] = p8r[q4];
     }
-    c32_sync_window();
-    // p8 rows are wave-owned; V rows were published by the barrier above.
+    // No barrier: the PV GEMM reads p8 rows owned by the same wave (V rows
+    // were published by barrier 3).
 
     {
         using namespace linalg;
@@ -337,7 +350,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             packed[(first + rc3.x) * 36u + 16u + rc3.y] = e4m3_byte_fast(rav1.Get(i));
         }
     }
-    c32_sync_window();
+    // No barrier: the projection's A tile reads packed rows 0-63 owned by the
+    // same wave's PV store above (proj_w is global).
 
     {
         using namespace linalg;
