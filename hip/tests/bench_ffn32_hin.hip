@@ -82,7 +82,7 @@ __global__ void k_ffn_f32_v(const float* input, const u8* weights, const float* 
             for (uint g = 0; g < C / 32; ++g) {
                 A8 a = A8::Load(inb + t0 * C, g * 32, C);
                 uint col = (sub * 4 + n) * 16;
-                B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
+                B8 b = B8::LoadRowT(weights, ((col / 16) * (C / 32) + g) * 512, 16);
                 ex.MultiplyAccumulate(a, b);
             }
             for (uint i = 0; i < ex.Length(); ++i)
@@ -117,7 +117,7 @@ __global__ void k_ffn_f32_v(const float* input, const u8* weights, const float* 
         }
         for (uint g = 0; g < hidden_c / 32; ++g) {
             A8 a = A8::Load(hidden + t0 * hidden_c, g * 32, hidden_c);
-            B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
+            B8 b = B8::LoadRowT(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
             acc.MultiplyAccumulate(a, b);
         }
         for (uint i = 0; i < acc.Length(); ++i) {

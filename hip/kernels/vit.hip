@@ -16,7 +16,7 @@ __global__ void k_gemm_tiled_f8(const u8* A, const u8* Btiles, u8* C, uint M, ui
     for (uint g = 0; g < K / 32; g++) {
         A8 a = A8::Load(A, m0 * K + g * 32u, K);
         uint boff = ((n0 / 16u) * (K / 32u) + g) * 512u;
-        B8 b = B8::LoadRow(Btiles, boff, 16);
+        B8 b = B8::LoadRowT(Btiles, boff, 16);
         acc.MultiplyAccumulate(a, b);
     }
     if (activate) {
@@ -83,7 +83,7 @@ __global__ void k_vit_ffn_fused(const float* input, const u8* w_expand, const u8
             A8 a = A8::Load(Ast, g * 32u, HSTRIDE);
             for (uint n = 0; n < 4u; n++) {
                 const uint col = wave * 64u + n * 16u;
-                B8 b = B8::LoadRow(w_expand, ((q * 64u + (col >> 4u)) * 32u + g) * 512u, 16);
+                B8 b = B8::LoadRowT(w_expand, ((q * 64u + (col >> 4u)) * 32u + g) * 512u, 16);
                 acc[n].MultiplyAccumulate(a, b);
             }
         }
@@ -104,7 +104,7 @@ __global__ void k_vit_ffn_fused(const float* input, const u8* w_expand, const u8
             A8 a = A8::Load(hid, g * 32u, HSTRIDE);
             for (uint n = 0; n < 4u; n++) {
                 const uint col = wave * 64u + n * 16u;
-                B8 b = B8::LoadRow(w_contract, (((col >> 4u) * 128u + q * 32u + g) * 512u), 16);
+                B8 b = B8::LoadRowT(w_contract, (((col >> 4u) * 128u + q * 32u + g) * 512u), 16);
                 part[n].MultiplyAccumulate(a, b);
             }
         }
@@ -156,7 +156,7 @@ __global__ void k_vit_ffn_quarter(const float* input, const u8* w_expand, const 
         A8 a = A8::Load(Ast, g * 32u, HSTRIDE);
         for (uint n = 0; n < 4u; n++) {
             const uint col = wave * 64u + n * 16u;
-            B8 b = B8::LoadRow(w_expand, ((q * 64u + (col >> 4u)) * 32u + g) * 512u, 16);
+            B8 b = B8::LoadRowT(w_expand, ((q * 64u + (col >> 4u)) * 32u + g) * 512u, 16);
             acc[n].MultiplyAccumulate(a, b);
         }
     }
@@ -175,7 +175,7 @@ __global__ void k_vit_ffn_quarter(const float* input, const u8* w_expand, const 
         A8 a = A8::Load(hid, g * 32u, HSTRIDE);
         for (uint n = 0; n < 4u; n++) {
             const uint col = wave * 64u + n * 16u;
-            B8 b = B8::LoadRow(w_contract, (((col >> 4u) * 128u + q * 32u + g) * 512u), 16);
+            B8 b = B8::LoadRowT(w_contract, (((col >> 4u) * 128u + q * 32u + g) * 512u), 16);
             part[n].MultiplyAccumulate(a, b);
         }
     }

@@ -260,10 +260,52 @@ void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint 
     LAUNCH(k_pool_f32, (ow * oh * c + 255) / 256, 256, src, dst, w, h, c, ow, oh);
 }
 void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint h, uint c,
-                       uint ow, uint oh) {
+                        uint ow, uint oh) {
     if (!w || !h || w % 2 || h % 2 || ow < w / 2 || oh < h / 2 || src == dst || !dst_h)
         throw std::runtime_error("pool f16 extent/alias");
     LAUNCH(k_pool_f32, (ow * oh * c + 255) / 256, 256, src, dst, w, h, c, ow, oh, dst_h);
+}
+
+// Fat-M dispatch: one B-tile load per K step serves SUB 16-row subtiles per
+// wave. Same numerics as k_linear_f32 (identical K order, partitions,
+// residual init and epilogue), less global weight traffic. Falls back to the
+// 16-row CTA kernel when m is too small for a full fat grid.
+template <bool F8IN, bool F8OUT, bool HRID, bool HOUT, bool F8OUT_RASTER, bool F8RES,
+          bool HOUT_RASTER, int SUB, bool PART>
+static void launch_linear_fat(const float* in, const u8* in8, const u8* w, float* out, u8* out8,
+                              uint m, uint n, uint k, const float* residual, const float* scales,
+                              int mode, int ordered, bool matrix_residual,
+                              const __half* residual_h, __half* out_h, u8* out8_raster, uint rw,
+                              uint rh, uint rsw, uint rpx, uint rpy, const u8* residual_f8,
+                              __half* out_h_raster) {
+    if (m >= 16u * SUB)
+        LAUNCH((k_linear_f32_fat<F8IN, F8OUT, HRID, HOUT, F8OUT_RASTER, F8RES, HOUT_RASTER, SUB,
+                                  PART>),
+               dim3((m + 16u * SUB - 1u) / (16u * SUB), (n + 63) / 64), n < 64 ? 64 : 128, in, in8, w,
+               out, out8, m, n, k, residual, scales, mode, ordered, matrix_residual, residual_h,
+               out_h, out8_raster, rw, rh, rsw, rpx, rpy, residual_f8, out_h_raster);
+    else
+        LAUNCH((k_linear_f32<F8IN, F8OUT, HRID, HOUT, F8OUT_RASTER, F8RES, HOUT_RASTER>),
+               dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, in, in8, w, out, out8, m, n, k,
+               residual, scales, mode, ordered, matrix_residual, residual_h, out_h, out8_raster,
+               rw, rh, rsw, rpx, rpy, residual_f8, out_h_raster);
+}
+template <bool F8IN, bool F8OUT, bool HRID, bool HOUT, bool F8OUT_RASTER, bool F8RES,
+          bool HOUT_RASTER, int SUB>
+static void launch_linear_fat_ord(const float* in, const u8* in8, const u8* w, float* out, u8* out8,
+                                  uint m, uint n, uint k, const float* residual,
+                                  const float* scales, int mode, int ordered, bool matrix_residual,
+                                  const __half* residual_h, __half* out_h, u8* out8_raster, uint rw,
+                                  uint rh, uint rsw, uint rpx, uint rpy, const u8* residual_f8,
+                                  __half* out_h_raster) {
+    if (ordered == 2)
+        launch_linear_fat<F8IN, F8OUT, HRID, HOUT, F8OUT_RASTER, F8RES, HOUT_RASTER, SUB, true>(
+            in, in8, w, out, out8, m, n, k, residual, scales, mode, ordered, matrix_residual,
+            residual_h, out_h, out8_raster, rw, rh, rsw, rpx, rpy, residual_f8, out_h_raster);
+    else
+        launch_linear_fat<F8IN, F8OUT, HRID, HOUT, F8OUT_RASTER, F8RES, HOUT_RASTER, SUB, false>(
+            in, in8, w, out, out8, m, n, k, residual, scales, mode, ordered, matrix_residual,
+            residual_h, out_h, out8_raster, rw, rh, rsw, rpx, rpy, residual_f8, out_h_raster);
 }
 
 void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n, uint k,
@@ -272,8 +314,9 @@ void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n,
         (residual && !scales) || in == out || ordered < 0 || ordered > 2 ||
         (ordered == 2 && k % 128))
         throw std::runtime_error("linear geometry/alias");
-    LAUNCH((k_linear_f32<false, false>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, in, nullptr, w, out,
-           nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual);
+    launch_linear_fat_ord<false, false, false, false, false, false, false, 4>(
+        in, nullptr, w, out, nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual,
+        nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, nullptr, nullptr);
 }
 void launch_linear_f32_f8out(const float* in, const u8* w, float* out, u8* out_f8, uint m,
                              uint n, uint k, const float* residual, const float* scales, int mode,
@@ -282,8 +325,9 @@ void launch_linear_f32_f8out(const float* in, const u8* w, float* out, u8* out_f
         (residual && !scales) || in == out || ordered < 0 || ordered > 2 ||
         (ordered == 2 && k % 128) || !out_f8)
         throw std::runtime_error("linear geometry/alias");
-    LAUNCH((k_linear_f32<false, true>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, in, nullptr, w, out,
-           out_f8, m, n, k, residual, scales, mode, ordered, matrix_residual);
+    launch_linear_fat_ord<false, true, false, false, false, false, false, 4>(
+        in, nullptr, w, out, out_f8, m, n, k, residual, scales, mode, ordered, matrix_residual,
+        nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, nullptr, nullptr);
 }
 void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
                             const float* residual, const float* scales, int mode, int ordered,
@@ -292,8 +336,9 @@ void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint 
         (residual && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out))
         throw std::runtime_error("linear geometry/alias");
-    LAUNCH((k_linear_f32<true, false>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, nullptr, in, w, out,
-           nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual);
+    launch_linear_fat_ord<true, false, false, false, false, false, false, 4>(
+        nullptr, in, w, out, nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual,
+        nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, nullptr, nullptr);
 }
 void launch_linear_f32_f8in_hrid(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
                                  const __half* residual_h, const float* scales, int mode, int ordered,
@@ -303,9 +348,10 @@ void launch_linear_f32_f8in_hrid(const u8* in, const u8* w, float* out, uint m, 
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out))
         throw std::runtime_error("linear geometry/alias");
     // residual_h doubles as the non-null enable flag for the residual path.
-    LAUNCH((k_linear_f32<true, false, true>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, nullptr, in,
-           w, out, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h), scales, mode,
-           ordered, matrix_residual, residual_h);
+    launch_linear_fat_ord<true, false, true, false, false, false, false, 4>(
+        nullptr, in, w, out, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h), scales,
+        mode, ordered, matrix_residual, residual_h, nullptr, nullptr, 0, 0, 0, 0, 0, nullptr,
+        nullptr);
 }
 void launch_linear_f32_f8in_hrid_hout(const u8* in, const u8* w, __half* out_h, uint m, uint n,
                                       uint k, const __half* residual_h, const float* scales,
@@ -313,9 +359,10 @@ void launch_linear_f32_f8in_hrid_hout(const u8* in, const u8* w, __half* out_h, 
     if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 ||
         (residual_h && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) || !out_h)
         throw std::runtime_error("linear geometry/alias");
-    LAUNCH((k_linear_f32<true, false, true, true>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, nullptr,
-           in, w, nullptr, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h), scales,
-           mode, ordered, matrix_residual, residual_h, out_h);
+    launch_linear_fat_ord<true, false, true, true, false, false, false, 4>(
+        nullptr, in, w, nullptr, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h),
+        scales, mode, ordered, matrix_residual, residual_h, out_h, nullptr, 0, 0, 0, 0, 0, nullptr,
+        nullptr);
 }
 void launch_linear_f32_f8in_hrid_hout_raster(const u8* in, const u8* w, __half* out_h,
                                               __half* out_h_raster, uint m, uint n, uint k,
@@ -326,11 +373,10 @@ void launch_linear_f32_f8in_hrid_hout_raster(const u8* in, const u8* w, __half* 
         ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) || !out_h || !out_h_raster ||
         rsw % 8 || rw + rpx > rsw || rh + rpy > rsw)
         throw std::runtime_error("linear raster f16 extent/alias");
-    LAUNCH((k_linear_f32<true, false, true, true, false, false, true>),
-           dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, nullptr, in, w, nullptr, nullptr, m, n, k,
-           reinterpret_cast<const float*>(residual_h), scales, mode, ordered, matrix_residual,
-           residual_h, out_h, nullptr, rw, rh, rsw, rpx, rpy,
-           reinterpret_cast<const u8*>(residual_h), out_h_raster);
+    launch_linear_fat_ord<true, false, true, true, false, false, true, 4>(
+        nullptr, in, w, nullptr, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h),
+        scales, mode, ordered, matrix_residual, residual_h, out_h, nullptr, rw, rh, rsw, rpx, rpy,
+        reinterpret_cast<const u8*>(residual_h), out_h_raster);
 }
 void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                   uint n, uint k, const float* residual, const float* scales,
@@ -339,8 +385,9 @@ void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out
         (residual && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8)
         throw std::runtime_error("linear geometry/alias");
-    LAUNCH((k_linear_f32<true, true>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, nullptr, in, w, out,
-           out_f8, m, n, k, residual, scales, mode, ordered, matrix_residual);
+    launch_linear_fat_ord<true, true, false, false, false, false, false, 4>(
+        nullptr, in, w, out, out_f8, m, n, k, residual, scales, mode, ordered, matrix_residual,
+        nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, nullptr, nullptr);
 }
 void launch_linear_f32_f8in_f8out_f8res(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                         uint n, uint k, const u8* residual_f8,
@@ -350,10 +397,10 @@ void launch_linear_f32_f8in_f8out_f8res(const u8* in, const u8* w, float* out, u
         ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8)
         throw std::runtime_error("linear f8res extent/alias");
-    LAUNCH((k_linear_f32<true, true, false, false, false, true>),
-           dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, nullptr, in, w, out, out_f8, m, n, k,
-           reinterpret_cast<const float*>(residual_f8), scales, mode, ordered, matrix_residual,
-           nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, residual_f8);
+    launch_linear_fat_ord<true, true, false, false, false, true, false, 4>(
+        nullptr, in, w, out, out_f8, m, n, k, reinterpret_cast<const float*>(residual_f8), scales,
+        mode, ordered, matrix_residual, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, residual_f8,
+        nullptr);
 }
 void launch_linear_f32_f8in_f8out_hrid(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                        uint n, uint k, const __half* residual_h,
@@ -363,9 +410,10 @@ void launch_linear_f32_f8in_f8out_hrid(const u8* in, const u8* w, float* out, u8
         ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8)
         throw std::runtime_error("linear f16res extent/alias");
-    LAUNCH((k_linear_f32<true, true, true>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128, nullptr, in,
-           w, out, out_f8, m, n, k, reinterpret_cast<const float*>(residual_h), scales, mode,
-           ordered, matrix_residual, residual_h);
+    launch_linear_fat_ord<true, true, true, false, false, false, false, 4>(
+        nullptr, in, w, out, out_f8, m, n, k, reinterpret_cast<const float*>(residual_h), scales,
+        mode, ordered, matrix_residual, residual_h, nullptr, nullptr, 0, 0, 0, 0, 0, nullptr,
+        nullptr);
 }
 void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, u8* out_f8_raster,
                                           uint m, uint n, uint k, const float* residual,
@@ -377,9 +425,9 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8_raster ||
         rsw % 8 || rw + rpx > rsw || rh + rpy > rsw)
         throw std::runtime_error("linear raster f8 extent/alias");
-    LAUNCH((k_linear_f32<true, false, false, false, true>), dim3((m + 15) / 16, (n + 63) / 64), n < 64 ? 64 : 128,
-           nullptr, in, w, out, nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual,
-           nullptr, nullptr, out_f8_raster, rw, rh, rsw, rpx, rpy);
+    launch_linear_fat_ord<true, false, false, false, true, false, false, 4>(
+        nullptr, in, w, out, nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual,
+        nullptr, nullptr, out_f8_raster, rw, rh, rsw, rpx, rpy, nullptr, nullptr);
 }
 
 

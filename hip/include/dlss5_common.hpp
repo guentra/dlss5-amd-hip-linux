@@ -194,18 +194,22 @@ __host__ __device__ inline float uniform24(u32 s) {
     return float(((w >> 30) ^ (w >> 8)) + 1) * 5.9604644775390625e-8f;
 }
 
-// 512-byte B-tile packing: [K=32][N=16] row-major from row-major [N][K].
+// 512-byte B-tile packing: [N=16][K=32] row-major from row-major [N][K].
+// The transposed (vs [K][N]) byte order makes each lane's WMMA B-fragment
+// bytes contiguous, so B8::LoadRowT issues vector loads per tile instead of
+// sixteen scattered byte loads plus byte permutes.
 inline void pack_tiled_e4m3(u8* dst, const float* src, size_t N, size_t K) {
     for (size_t t = 0; t < N / 16; t++)
         for (size_t g = 0; g < K / 32; g++)
-            for (size_t k = 0; k < 32; k++)
-                for (size_t j = 0; j < 16; j++)
-                    dst[(t * (K / 32) + g) * 512 + k * 16 + j] =
-                        e4m3_byte(src[(t * 16 + j) * K + g * 32 + k]);
+            for (size_t n = 0; n < 16; n++)
+                for (size_t k = 0; k < 32; k++)
+                    dst[(t * (K / 32) + g) * 512 + n * 32 + k] =
+                        e4m3_byte(src[(t * 16 + n) * K + g * 32 + k]);
 }
 
 // Within each 512-byte tile, pack the 8 K-bytes of one B fragment contiguously.
-// Same bytes the C256 tiled gather reads at stride 16 (k = half*16+group*8+e).
+// Input tiles are [N][K] (pack_tiled_e4m3); output is the frag order
+// [half2][group2][row16][k8] the C256 fragment loads read.
 inline void permute_tiled_tiles_to_frag(u8* bytes, size_t nbytes) {
     for (size_t base = 0; base < nbytes; base += 512) {
         u8 tmp[512];
@@ -214,7 +218,7 @@ inline void permute_tiled_tiles_to_frag(u8* bytes, size_t nbytes) {
                 for (int j = 0; j < 16; ++j)
                     for (int e = 0; e < 8; ++e) {
                         int k = half * 16 + group * 8 + e;
-                        tmp[((half * 2 + group) * 16 + j) * 8 + e] = bytes[base + k * 16 + j];
+                        tmp[((half * 2 + group) * 16 + j) * 8 + e] = bytes[base + j * 32 + k];
                     }
         for (int i = 0; i < 512; ++i)
             bytes[base + i] = tmp[i];

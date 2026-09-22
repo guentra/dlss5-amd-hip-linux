@@ -95,7 +95,7 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         }
         __syncthreads();
         A8 a = A8::Load(tile, 0, 32);
-        B8 b = B8::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 512u, 16);
+        B8 b = B8::LoadRowT(weights, ((col / 16u) * (k / 32u) + g) * 512u, 16);
         acc.MultiplyAccumulate(a, b);
         __syncthreads();
     }

@@ -28,7 +28,7 @@ __global__ void reference_linear(const float* input, const u8* weights, float* o
         }
         __syncthreads();
         A8 a = A8::Load(tile, 0, 32);
-        B8 b = B8::LoadRow(weights, ((col / 16) * (k / 32) + g) * 512, 16);
+        B8 b = B8::LoadRowT(weights, ((col / 16) * (k / 32) + g) * 512, 16);
         if (ordered == 2) {
             partition.MultiplyAccumulate(a,b);
             if ((g+1) % (k/128) == 0) {

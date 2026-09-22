@@ -21,7 +21,7 @@ __global__ void k_qkv(const u8* input, const u8* weights, u8* output, uint width
             if (col >= 3u * uint(C))
                 continue;
             uint boff = ((col / 16u) * uint(C / 32) + g) * 512u;
-            B8 b = B8::LoadRow(weights, boff, 16);
+            B8 b = B8::LoadRowT(weights, boff, 16);
             acc[n].MultiplyAccumulate(a, b);
         }
     }

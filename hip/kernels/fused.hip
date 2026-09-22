@@ -32,7 +32,7 @@ __global__ void k_c32_ffn_win(const u8* in, const u8* ffn_w, u8* out, uint width
             A8 a = A8::Load(feat, t0 * 32u, 32);
             for (uint n = 0; n < 4; n++) {
                 uint col = (sub * 4u + n) * 16u;
-                B8 b = B8::LoadRow(ffn_w, (col / 16u) * 512u, 16);
+                B8 b = B8::LoadRowT(ffn_w, (col / 16u) * 512u, 16);
                 acc[n].MultiplyAccumulate(a, b);
             }
             for (uint n = 0; n < 4; n++) {
@@ -49,7 +49,7 @@ __global__ void k_c32_ffn_win(const u8* in, const u8* ffn_w, u8* out, uint width
             u8* hid = hidden + grp * 16u * 128u;
             for (uint g = 0; g < 128u / 32u; g++) {
                 A8 a = A8::Load(hid, g * 32u, 128);
-                B8 b = B8::LoadRow(ffn_w, 128u * 32u + ((col / 16u) * 4u + g) * 512u, 16);
+                B8 b = B8::LoadRowT(ffn_w, 128u * 32u + ((col / 16u) * 4u + g) * 512u, 16);
                 acc.MultiplyAccumulate(a, b);
             }
             acc.StoreF8(feat, t0 * 32u + col, 32);
@@ -113,7 +113,7 @@ __global__ void k_stream8(const u8* in, const u8* ffn_w, const u8* proj0_w, cons
                     for (uint n = 0; n < 4; n++) {
                         uint col = (sub * 4u + n) * 16u;
                         uint boff = ((col / 16u) * uint(C / 32) + g) * 512u;
-                        B8 b = B8::LoadRow(ffn_w, boff, 16);
+                        B8 b = B8::LoadRowT(ffn_w, boff, 16);
                         acc[n].MultiplyAccumulate(a, b);
                     }
                 }
@@ -132,7 +132,7 @@ __global__ void k_stream8(const u8* in, const u8* ffn_w, const u8* proj0_w, cons
                 for (uint g = 0; g < uint(HIDDEN / 32); g++) {
                     A8 a = A8::Load(qkv + hid_off, g * 32u, uint(HIDDEN));
                     uint boff = uint(HIDDEN) * uint(C) + ((col / 16u) * uint(HIDDEN / 32) + g) * 512u;
-                    B8 b = B8::LoadRow(ffn_w, boff, 16);
+                    B8 b = B8::LoadRowT(ffn_w, boff, 16);
                     acc.MultiplyAccumulate(a, b);
                 }
                 acc.StoreF8(feat, t0 * uint(C) + col, uint(C));
@@ -152,7 +152,7 @@ __global__ void k_stream8(const u8* in, const u8* ffn_w, const u8* proj0_w, cons
                     }
                     for (uint g = 0; g < uint(C / 32); g++) {
                         A8 a = A8::Load(feat, t0 * uint(C) + g * 32u, uint(C));
-                        B8 b = B8::LoadRow(proj0_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
+                        B8 b = B8::LoadRowT(proj0_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
                         acc.MultiplyAccumulate(a, b);
                     }
                     for (uint i = 0; i < acc.Length(); i++)
@@ -178,7 +178,7 @@ __global__ void k_stream8(const u8* in, const u8* ffn_w, const u8* proj0_w, cons
                         uint col = (gy * 4u + n) * 16u;
                         if (col >= 3u * uint(C))
                             continue;
-                        B8 b = B8::LoadRow(qkv_w, ((col / 16u) * uint(C / 32) + g) * 512u, 16);
+                        B8 b = B8::LoadRowT(qkv_w, ((col / 16u) * uint(C / 32) + g) * 512u, 16);
                         acc[n].MultiplyAccumulate(a, b);
                     }
                 }
@@ -280,7 +280,7 @@ __global__ void k_stream8(const u8* in, const u8* ffn_w, const u8* proj0_w, cons
                 }
                 for (uint g = 0; g < uint(C / 32); g++) {
                     A8 a = A8::Load(feat, t0 * uint(C) + g * 32u, uint(C));
-                    B8 b = B8::LoadRow(proj_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
+                    B8 b = B8::LoadRowT(proj_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
                     acc.MultiplyAccumulate(a, b);
                 }
                 for (uint i = 0; i < acc.Length(); i++) {
@@ -335,7 +335,7 @@ __global__ void k_fused_swin(const u8* in, const u8* ffn_w, const u8* qkv_w, con
                 for (uint n = 0; n < 4; n++) {
                     uint col = (sub * 4u + n) * 16u;
                     uint boff = ((col / 16u) * uint(C / 32) + g) * 512u;
-                    B8 b = B8::LoadRow(ffn_w, boff, 16);
+                    B8 b = B8::LoadRowT(ffn_w, boff, 16);
                     acc[n].MultiplyAccumulate(a, b);
                 }
             }
@@ -355,7 +355,7 @@ __global__ void k_fused_swin(const u8* in, const u8* ffn_w, const u8* qkv_w, con
             for (uint g = 0; g < uint(HIDDEN / 32); g++) {
                 A8 a = A8::Load(hid, g * 32u, uint(HIDDEN));
                 uint boff = uint(HIDDEN) * uint(C) + ((col / 16u) * uint(HIDDEN / 32) + g) * 512u;
-                B8 b = B8::LoadRow(ffn_w, boff, 16);
+                B8 b = B8::LoadRowT(ffn_w, boff, 16);
                 acc.MultiplyAccumulate(a, b);
             }
             acc.StoreF8(feat, t0 * uint(C) + col, uint(C));
@@ -373,7 +373,7 @@ __global__ void k_fused_swin(const u8* in, const u8* ffn_w, const u8* qkv_w, con
                 }
                 for (uint g = 0; g < uint(C / 32); g++) {
                     A8 a = A8::Load(feat, t0 * uint(C) + g * 32u, uint(C));
-                    B8 b = B8::LoadRow(proj0_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
+                    B8 b = B8::LoadRowT(proj0_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
                     acc.MultiplyAccumulate(a, b);
                 }
                 for (uint i = 0; i < acc.Length(); i++)
@@ -396,7 +396,7 @@ __global__ void k_fused_swin(const u8* in, const u8* ffn_w, const u8* qkv_w, con
                         uint col = (gy * 4u + n) * 16u;
                         if (col >= 3u * uint(C))
                             continue;
-                        B8 b = B8::LoadRow(qkv_w, ((col / 16u) * uint(C / 32) + g) * 512u, 16);
+                        B8 b = B8::LoadRowT(qkv_w, ((col / 16u) * uint(C / 32) + g) * 512u, 16);
                         acc[n].MultiplyAccumulate(a, b);
                     }
                 }
@@ -495,7 +495,7 @@ __global__ void k_fused_swin(const u8* in, const u8* ffn_w, const u8* qkv_w, con
                 }
                 for (uint g = 0; g < uint(C / 32); g++) {
                     A8 a = A8::Load(feat, t0 * uint(C) + g * 32u, uint(C));
-                    B8 b = B8::LoadRow(proj_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
+                    B8 b = B8::LoadRowT(proj_w, ((n0 / 16u) * uint(C / 32) + g) * 512u, 16);
                     acc.MultiplyAccumulate(a, b);
                 }
                 for (uint i = 0; i < acc.Length(); i++) {
@@ -555,7 +555,7 @@ __global__ void k_fused_ffn_qkv(const u8* in, const u8* ffn_w, const u8* proj0_w
                     for (uint n = 0; n < 4; n++) {
                         uint col = (sub * 4u + n) * 16u;
                         uint boff = ((col / 16u) * uint(C / 32) + g) * 512u;
-                        B8 b = B8::LoadRow(fw, boff, 16);
+                        B8 b = B8::LoadRowT(fw, boff, 16);
                         acc[n].MultiplyAccumulate(a, b);
                     }
                 }
@@ -573,7 +573,7 @@ __global__ void k_fused_ffn_qkv(const u8* in, const u8* ffn_w, const u8* proj0_w
                 for (uint g = 0; g < uint(HIDDEN / 32); g++) {
                     A8 a = A8::Load(hidden + hid_off, g * 32u, uint(HIDDEN));
                     uint boff = uint(HIDDEN) * uint(C) + ((col / 16u) * uint(HIDDEN / 32) + g) * 512u;
-                    B8 b = B8::LoadRow(fw, boff, 16);
+                    B8 b = B8::LoadRowT(fw, boff, 16);
                     acc.MultiplyAccumulate(a, b);
                 }
                 acc.StoreF8(feat, t0 * uint(C) + col, uint(C));
@@ -595,7 +595,7 @@ __global__ void k_fused_ffn_qkv(const u8* in, const u8* ffn_w, const u8* proj0_w
                     for (uint g = 0; g < uint(C / 32); g++) {
                         A8 a = A8::Load(feat, t0 * uint(C) + g * 32u, uint(C));
                         uint boff = ((n0 / 16u) * uint(C / 32) + g) * 512u;
-                        B8 b = B8::LoadRow(proj0_w, boff, 16);
+                        B8 b = B8::LoadRowT(proj0_w, boff, 16);
                         acc.MultiplyAccumulate(a, b);
                     }
                     for (uint i = 0; i < acc.Length(); i++)
@@ -620,7 +620,7 @@ __global__ void k_fused_ffn_qkv(const u8* in, const u8* ffn_w, const u8* proj0_w
                         if (col >= 3u * uint(C))
                             continue;
                         uint boff = ((col / 16u) * uint(C / 32) + g) * 512u;
-                        B8 b = B8::LoadRow(qkv_w, boff, 16);
+                        B8 b = B8::LoadRowT(qkv_w, boff, 16);
                         acc[n].MultiplyAccumulate(a, b);
                     }
                 }
@@ -733,7 +733,7 @@ __global__ void k_fused_attn_proj(const u8* qkv, const float* bias, const u8* pr
                 for (uint g = 0; g < uint(C / 32); g++) {
                     A8 a = A8::Load(feat, t0 * uint(C) + g * 32u, uint(C));
                     uint boff = ((n0 / 16u) * uint(C / 32) + g) * 512u;
-                    B8 b = B8::LoadRow(proj_w, boff, 16);
+                    B8 b = B8::LoadRowT(proj_w, boff, 16);
                     acc.MultiplyAccumulate(a, b);
                 }
                 for (uint i = 0; i < acc.Length(); i++) {

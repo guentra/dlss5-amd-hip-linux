@@ -25,7 +25,7 @@ __global__ void k_ffn_fused(const u8* input, const u8* weights, float* output_f3
             for (uint n = 0; n < 4; n++) {
                 uint col = (wave * 4u + n) * 16u;
                 uint boff = ((col / 16u) * uint(C / 32) + g) * 512u;
-                B8 b = B8::LoadRow(weights, boff, 16);
+                B8 b = B8::LoadRowT(weights, boff, 16);
                 acc[n].MultiplyAccumulate(a, b);
             }
         }
@@ -43,7 +43,7 @@ __global__ void k_ffn_fused(const u8* input, const u8* weights, float* output_f3
         for (uint g = 0; g < uint(HIDDEN / 32); g++) {
             A8 a = A8::Load(hidden, g * 32u, uint(HIDDEN));
             uint boff = uint(HIDDEN) * uint(C) + ((col / 16u) * uint(HIDDEN / 32) + g) * 512u;
-            B8 b = B8::LoadRow(weights, boff, 16);
+            B8 b = B8::LoadRowT(weights, boff, 16);
             acc.MultiplyAccumulate(a, b);
         }
         if (!fp8_out) {

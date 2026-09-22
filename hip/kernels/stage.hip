@@ -71,7 +71,7 @@ __global__ void k_split_ffwd(const u8* in, const u8* pre, const u8* expand, cons
         for (uint g = 0; g < 512 / 32; g++) {
             A8 a = A8::Load(in, first * 512u + g * 32u, 512);
             uint boff = ((n0 / 16u) * (512u / 32u) + g) * 512u;
-            B8 b = B8::LoadRow(pre, boff, 16);
+            B8 b = B8::LoadRowT(pre, boff, 16);
             acc.MultiplyAccumulate(a, b);
         }
         for (uint i = 0; i < acc.Length(); i++)
@@ -85,7 +85,7 @@ __global__ void k_split_ffwd(const u8* in, const u8* pre, const u8* expand, cons
             for (uint g = 0; g < 64 / 32; g++) {
                 A8 a = A8::Load(mix, grp * 64u + g * 32u, 512);
                 uint boff = (grp * (256u / 16u) * (64u / 32u) + (n0 / 16u) * (64u / 32u) + g) * 512u;
-                B8 b = B8::LoadRow(expand, boff, 16);
+                B8 b = B8::LoadRowT(expand, boff, 16);
                 acc.MultiplyAccumulate(a, b);
             }
             for (uint i = 0; i < acc.Length(); i++)
@@ -98,7 +98,7 @@ __global__ void k_split_ffwd(const u8* in, const u8* pre, const u8* expand, cons
             for (uint g = 0; g < 256 / 32; g++) {
                 A8 a = A8::Load(hid, g * 32u, 256);
                 uint boff = (grp * (64u / 16u) * (256u / 32u) + (n0 / 16u) * (256u / 32u) + g) * 512u;
-                B8 b = B8::LoadRow(contract, boff, 16);
+                B8 b = B8::LoadRowT(contract, boff, 16);
                 acc.MultiplyAccumulate(a, b);
             }
             for (uint i = 0; i < acc.Length(); i++)

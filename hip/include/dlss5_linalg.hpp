@@ -59,6 +59,31 @@ struct MatrixB {
         rocwmma::load_matrix_sync(b.k1r, p + 16 * ldm, ldm);
         return b;
     }
+    // 512-byte B-tile packed [N=16][K=32] row-major (pack_tiled_e4m3). Lane l
+    // owns fragment element [e] = B[k = (l>>4)*8+e][n = l&15] for k0r and
+    // B[k = (l>>4)*8+16+e][n = l&15] for k1r: two contiguous spans in this
+    // layout, so each half-fragment is one vector load (vs the scattered byte
+    // loads LoadRow needs for [K][N] tiles).
+    template <typename Ptr>
+    __device__ static MatrixB LoadRowT(Ptr buf, uint byte_off, uint stride_bytes) {
+        (void)stride_bytes;
+        const DataT* p = reinterpret_cast<const DataT*>(
+            reinterpret_cast<const char*>(buf) + byte_off);
+        const uint n = threadIdx.x & 15u;
+        const uint kb = ((threadIdx.x >> 4) & 1u) * 8u;
+        const DataT* base = p + n * 32u + kb;
+        MatrixB b;
+        b.row = true;
+        alignas(16) DataT t0[8], t1[8];
+        __builtin_memcpy(t0, base, 8 * sizeof(DataT));
+        __builtin_memcpy(t1, base + 16, 8 * sizeof(DataT));
+#pragma unroll
+        for (uint e = 0; e < 8u; ++e) {
+            b.k0r[e] = t0[e];
+            b.k1r[e] = t1[e];
+        }
+        return b;
+    }
     template <typename Ptr>
     __device__ static MatrixB LoadRowMajorOut(Ptr buf, uint out_col, uint k0, uint k_stride) {
         const DataT* base = reinterpret_cast<const DataT*>(buf) +

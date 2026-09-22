@@ -65,7 +65,7 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
         A8 a = A8::Load(tile, 0, 32);
         // Four output waves share one converted input tile. In the final
         // partial group, inactive waves read a valid tile and omit stores.
-        B8 b = B8::LoadRow(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512, 16);
+        B8 b = B8::LoadRowT(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512, 16);
         if (ordered == 2) {
             partition.MultiplyAccumulate(a,b);
             if ((g+1) % (k/128) == 0) {
@@ -132,6 +132,141 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
             }
         }
     }
+}
+
+// Fat-M variant of k_linear_f32: each wave stacks SUB 16-row subtiles on the
+// same 16-column slice, so one B-tile load serves SUB row tiles. Global
+// weight traffic drops 4x while the per-element accumulation order (K loop,
+// ordered partitions, residual init, epilogue) is byte-for-byte unchanged.
+template <bool F8IN, bool F8OUT = false, bool HRID = false, bool HOUT = false,
+          bool F8OUT_RASTER = false, bool F8RES = false, bool HOUT_RASTER = false, int SUB = 4,
+          bool PART = false>
+__global__ void k_linear_f32_fat(const float* input, const u8* input_f8, const u8* weights,
+                                 float* output, u8* output_f8, uint m, uint n, uint k,
+                                 const float* residual, const float* scales, int mode, int ordered,
+                                 bool matrix_residual = false, const __half* residual_h = nullptr,
+                                 __half* output_h = nullptr, u8* output_f8_raster = nullptr,
+                                 uint rw = 0, uint rh = 0, uint rsw = 0, uint rpx = 0, uint rpy = 0,
+                                 const u8* residual_f8 = nullptr, __half* output_h_raster = nullptr) {
+    using namespace linalg;
+    constexpr uint ROWS = 16u * SUB;
+    const uint first = blockIdx.x * ROWS;
+    const uint col = blockIdx.y * 64 + (threadIdx.x / 32u) * 16u;
+    const uint rc_y = threadIdx.x & 15u;
+    const float scale_c = (scales && col < n) ? scales[col + rc_y] : 0.f;
+    __shared__ u8 tile[ROWS * 32u];
+    C32 acc[SUB];
+    for (uint s = 0; s < SUB; ++s)
+        acc[s] = C32::Splat(0.f);
+    if ((F8RES && residual_f8) || (residual && mode != 4))
+        for (uint s = 0; s < SUB; ++s)
+            for (uint i = 0; i < acc[s].Length(); ++i) {
+                uint2 rc = acc[s].GetCoordinate(i);
+                const uint row = first + s * 16u + rc.x;
+                if (row < m && col < n) {
+                    float rv;
+                    if (F8RES && residual_f8)
+                        rv = from_e4m3(residual_f8[row * n + col + rc.y]);
+                    else
+                        rv = HRID ? __half2float(residual_h[row * n + col + rc.y])
+                                  : residual[row * n + col + rc.y];
+                    acc[s].Set(i, matrix_residual ? rv * scale_c : H(rv * scale_c));
+                }
+            }
+    C32 partition[SUB];
+    if constexpr (PART)
+        for (uint s = 0; s < SUB; ++s)
+            partition[s] = C32::Splat(0.f);
+    for (uint g = 0; g < k / 32; ++g) {
+        for (uint i4 = threadIdx.x; i4 < ROWS * 8u; i4 += blockDim.x) {
+            const uint c4 = (i4 % 8u) * 4u;
+            const uint row = first + i4 / 8u;
+            if (F8IN) {
+                *reinterpret_cast<u32*>(tile + i4 * 4u) =
+                    row < m ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + c4)
+                            : 0u;
+            } else {
+                const float4 v =
+                    row < m ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + c4)
+                            : make_float4(0.f, 0.f, 0.f, 0.f);
+                *reinterpret_cast<u32*>(tile + i4 * 4u) =
+                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            }
+        }
+        __syncthreads();
+        B8 b = B8::LoadRowT(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512, 16);
+#pragma unroll
+        for (uint s = 0; s < SUB; ++s) {
+            A8 a = A8::Load(tile, s * 16u * 32u, 32);
+            if constexpr (PART) {
+                partition[s].MultiplyAccumulate(a, b);
+                if ((g + 1) % (k / 128) == 0) {
+                    for (uint i = 0; i < acc[s].Length(); ++i)
+                        acc[s].Set(i, acc[s].Get(i) + partition[s].Get(i));
+                    partition[s] = C32::Splat(0.f);
+                }
+            } else if (ordered == 1) {
+                C32 part = Multiply(a, b);
+                for (uint i = 0; i < acc[s].Length(); ++i)
+                    acc[s].Set(i, H(acc[s].Get(i) + part.Get(i)));
+            } else
+                acc[s].MultiplyAccumulate(a, b);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint s = 0; s < SUB; ++s)
+        for (uint i = 0; i < acc[s].Length(); ++i) {
+            uint2 rc = acc[s].GetCoordinate(i);
+            const uint row = first + s * 16u + rc.x;
+            float v = acc[s].Get(i);
+            if (mode == 4 && residual && row < m && col < n)
+                v += (HRID ? __half2float(residual_h[row * n + col + rc.y])
+                           : residual[row * n + col + rc.y]) * scale_c;
+            u8 qout = 0;
+            if (mode == 2) {
+                u8 q = e4m3_byte(ActivatePoly(v));
+                v = from_e4m3(q);
+                if constexpr (F8OUT || F8OUT_RASTER) qout = q;
+            } else if (mode == 1) {
+                u8 q = e4m3_byte(H(v));
+                v = from_e4m3(q);
+                if constexpr (F8OUT || F8OUT_RASTER) qout = q;
+            } else if (mode == 5) {
+                u8 q = e4m3_byte(v);
+                v = from_e4m3(q);
+                if constexpr (F8OUT || F8OUT_RASTER) qout = q;
+            } else if (mode == 0 || mode == 4) v = H(v);
+            if (row < m && col < n) {
+                if constexpr (HOUT) {
+                    output_h[row * n + col + rc.y] = __float2half_rn(v);
+                    if constexpr (HOUT_RASTER) {
+                        uint t = row;
+                        uint win = t / 64u, tok = t % 64u;
+                        uint wx = (win % (rsw / 8u)) * 8u + (tok % 8u);
+                        uint wy = (win / (rsw / 8u)) * 8u + (tok / 8u);
+                        if (wx >= rpx && wy >= rpy && wx < rw + rpx && wy < rh + rpy)
+                            output_h_raster[((wy - rpy) * rw + (wx - rpx)) * n + col + rc.y] =
+                                __float2half_rn(v);
+                    }
+                } else {
+                    if (output)
+                        output[row * n + col + rc.y] = v;
+                    if constexpr (F8OUT)
+                        output_f8[row * n + col + rc.y] = qout;
+                    if constexpr (F8OUT_RASTER) {
+                        uint t = row;
+                        uint win = t / 64u, tok = t % 64u;
+                        uint wx = (win % (rsw / 8u)) * 8u + (tok % 8u);
+                        uint wy = (win / (rsw / 8u)) * 8u + (tok / 8u);
+                        if (wx >= rpx && wy >= rpy && wx < rw + rpx && wy < rh + rpy)
+                            output_f8_raster[((wy - rpy) * rw + (wx - rpx)) * n + col + rc.y] =
+                                qout;
+                    }
+                }
+            }
+        }
 }
 
 template <int C, bool F8OUT = false, int GROUPS = 1, bool HOUT = false, bool F8IN = false,
@@ -222,7 +357,7 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             A8 a = A8::Load(in + t0 * C, g * 32, C);
             for (uint n = 0; n < 4; ++n) {
                 uint col = (sub * 4 + n) * 16;
-                B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
+                B8 b = B8::LoadRowT(weights, ((col / 16) * (C / 32) + g) * 512, 16);
                 ex[n].MultiplyAccumulate(a, b);
             }
         }
@@ -291,7 +426,7 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
         }
         for (uint g = 0; g < hidden_c / 32; ++g) {
             A8 a = A8::Load(hidden + t0 * hidden_c, g * 32, hidden_c);
-            B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
+            B8 b = B8::LoadRowT(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
             acc.MultiplyAccumulate(a, b);
         }
         for (uint i = 0; i < acc.Length(); ++i) {
@@ -501,8 +636,8 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
      }
      __syncthreads();
     A16 a=A16::Load(tile,0,64);
-    B16 b = DIRECT_OUT ? B16::LoadRowMajorOut(weights, col, g * 32u, k)
-                       : B16::LoadRow(weights, ((col / 16) * (k / 32) + g) * 1024, 32);
+     B16 b = DIRECT_OUT ? B16::LoadRowMajorOut(weights, col, g * 32u, k)
+                        : B16::LoadRow(weights, ((col / 16) * (k / 32) + g) * 1024, 32);
     if(ordered){C32 p=Multiply(a,b);for(uint i=0;i<acc.Length();++i)acc.Set(i,H(acc.Get(i)+p.Get(i)));}
     else acc.MultiplyAccumulate(a,b);
    __syncthreads();
@@ -545,15 +680,15 @@ __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const
      }
     }
    __syncthreads();
-  a.MultiplyAccumulate(A8::Load(tile,0,32),B8::LoadRow(pre,((group*4+wave)*16+g)*512,16));__syncthreads();
+  a.MultiplyAccumulate(A8::Load(tile,0,32),B8::LoadRowT(pre,((group*4+wave)*16+g)*512,16));__syncthreads();
  }
  for(uint i=0;i<a.Length();++i)a.Set(i,H(a.Get(i)));a.StoreF8(mix,wave*16,64);__syncthreads();
  for(uint j=0;j<4;++j){C32 acc=C32::Splat(0.f);uint col=wave*64+j*16;
-  for(uint g=0;g<2;++g)acc.MultiplyAccumulate(A8::Load(mix,g*32,64),B8::LoadRow(expand,group*16384+((col/16)*2+g)*512,16));
+  for(uint g=0;g<2;++g)acc.MultiplyAccumulate(A8::Load(mix,g*32,64),B8::LoadRowT(expand,group*16384+((col/16)*2+g)*512,16));
   for(uint i=0;i<acc.Length();++i)acc.Set(i,ActivatePoly(H(acc.Get(i))));acc.StoreF8(hid,col,256);
  }
  __syncthreads();C32 acc=C32::Splat(0.f);
- for(uint g=0;g<8;++g)acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
+ for(uint g=0;g<8;++g)acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRowT(contract,group*16384+(wave*8+g)*512,16));
   for(uint i=0;i<acc.Length();++i){uint2 rc=acc.GetCoordinate(i);if(first+rc.x<tokens){u8 q=e4m3_byte(H(acc.Get(i)));if constexpr(F8OUT)out_f8[(first+rc.x)*512+group*64+wave*16+rc.y]=q;out[(first+rc.x)*512+group*64+wave*16+rc.y]=from_e4m3(q);}}
 }
 

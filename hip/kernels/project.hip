@@ -28,7 +28,7 @@ __global__ void k_project(const u8* input, const u8* weights, const float* scale
         for (uint n = 0; n < uint(BLOCK_N); n++) {
             uint col = (gy * uint(BLOCK_N) + n) * 16u;
             uint boff = ((col / 16u) * uint(C / 32) + g) * 512u;
-            B8 b = B8::LoadRow(weights, boff, 16);
+            B8 b = B8::LoadRowT(weights, boff, 16);
             acc[n].MultiplyAccumulate(a, b);
         }
     }
