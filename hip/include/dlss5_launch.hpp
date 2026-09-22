@@ -157,7 +157,8 @@ void launch_trace_f32(const float*,uint n,float*,uint*);
 void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, const u8* qkv_w,
                       const float* qscale, const float* bias, const u8* proj_w, const float* proj_s,
                       __half* ffn_h, __half* out_h, __half* out_h_raster, uint w, uint h, uint sw,
-                      uint sh, uint px, uint py, bool chain, bool windowed, bool write_out = true);
+                      uint sh, uint px, uint py, bool chain, bool windowed, bool write_out = true,
+                      bool raster_in = false);
 void launch_c32_prod(const __half* in_h, const float* fw, const float* wgt, __half* out_h,
                      __half* out_h_raster, uint w, uint h, uint sw, uint sh, uint px, uint py,
                      bool chain);

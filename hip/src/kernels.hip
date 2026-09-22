@@ -757,70 +757,87 @@ void launch_trace_f32(const float* in,uint n,float* stats,uint* bits){LAUNCH(k_t
 void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, const u8* qkv_w,
                       const float* qscale, const float* bias, const u8* proj_w, const float* proj_s,
                       __half* ffn_h, __half* out_h, __half* out_h_raster, uint w, uint h, uint sw,
-                      uint sh, uint px, uint py, bool chain, bool windowed, bool write_out) {
+                      uint sh, uint px, uint py, bool chain, bool windowed, bool write_out,
+                      bool raster_in) {
     if (!in_h || !ffn_w || !ffn_s || !qkv_w || !qscale || !bias || !proj_w || !proj_s ||
         !out_h || sw % 8 || sh % 8 ||
         (windowed && (w + px > sw || h + py > sh)))
         throw std::runtime_error("C32 fused extent/alias");
     const uint nwin = sw * sh / 64u;
     const bool write_ffn = ffn_h != nullptr;
-    #define C32_FUSED_LAUNCH(C, W, WR, WO)                                                             \
-        LAUNCH((k_c32_fused<C, W, WR, WO>), nwin, 128, in_h, ffn_w, ffn_s, qkv_w, qscale, bias, proj_w, \
-               proj_s, ffn_h, out_h, out_h_raster, w, h, sw, sh, px, py)
+    // raster_in only makes sense for windowed blocks: the prefix-fed window is
+    // window-major (block 0).
+    raster_in = raster_in && windowed;
+    #define C32_FUSED_LAUNCH_W(C, WR, WO)                                                      \
+        do {                                                                                   \
+            if (raster_in)                                                                     \
+                LAUNCH((k_c32_fused<C, true, WR, WO, true>), nwin, 128, in_h, ffn_w, ffn_s,    \
+                       qkv_w, qscale, bias, proj_w, proj_s, ffn_h, out_h, out_h_raster, w, h,  \
+                       sw, sh, px, py);                                                       \
+            else                                                                               \
+                LAUNCH((k_c32_fused<C, true, WR, WO, false>), nwin, 128, in_h, ffn_w, ffn_s,   \
+                       qkv_w, qscale, bias, proj_w, proj_s, ffn_h, out_h, out_h_raster, w, h,  \
+                       sw, sh, px, py);                                                       \
+        } while (0)
+    #define C32_FUSED_LAUNCH_NW(C, WR, WO)                                                     \
+        LAUNCH((k_c32_fused<C, false, WR, WO, false>), nwin, 128, in_h, ffn_w, ffn_s, qkv_w,   \
+               qscale, bias, proj_w, proj_s, ffn_h, out_h, out_h_raster, w, h, sw, sh, px, py)
     if (chain) {
         if (windowed) {
             if (write_ffn) {
                 if (write_out)
-                    C32_FUSED_LAUNCH(true, true, true, true);
+                    C32_FUSED_LAUNCH_W(true, true, true);
                 else
-                    C32_FUSED_LAUNCH(true, true, true, false);
+                    C32_FUSED_LAUNCH_W(true, true, false);
             } else {
                 if (write_out)
-                    C32_FUSED_LAUNCH(true, true, false, true);
+                    C32_FUSED_LAUNCH_W(true, false, true);
                 else
-                    C32_FUSED_LAUNCH(true, true, false, false);
+                    C32_FUSED_LAUNCH_W(true, false, false);
             }
         } else {
             if (write_ffn) {
                 if (write_out)
-                    C32_FUSED_LAUNCH(true, false, true, true);
+                    C32_FUSED_LAUNCH_NW(true, true, true);
                 else
-                    C32_FUSED_LAUNCH(true, false, true, false);
+                    C32_FUSED_LAUNCH_NW(true, true, false);
             } else {
                 if (write_out)
-                    C32_FUSED_LAUNCH(true, false, false, true);
+                    C32_FUSED_LAUNCH_NW(true, false, true);
                 else
-                    C32_FUSED_LAUNCH(true, false, false, false);
+                    C32_FUSED_LAUNCH_NW(true, false, false);
             }
         }
     } else {
         if (windowed) {
             if (write_ffn) {
                 if (write_out)
-                    C32_FUSED_LAUNCH(false, true, true, true);
+                    C32_FUSED_LAUNCH_W(false, true, true);
                 else
-                    C32_FUSED_LAUNCH(false, true, true, false);
+                    C32_FUSED_LAUNCH_W(false, true, false);
             } else {
                 if (write_out)
-                    C32_FUSED_LAUNCH(false, true, false, true);
+                    C32_FUSED_LAUNCH_W(false, false, true);
                 else
-                    C32_FUSED_LAUNCH(false, true, false, false);
+                    C32_FUSED_LAUNCH_W(false, false, false);
             }
         } else {
             if (write_ffn) {
                 if (write_out)
-                    C32_FUSED_LAUNCH(false, false, true, true);
+                    C32_FUSED_LAUNCH_NW(false, true, true);
                 else
-                    C32_FUSED_LAUNCH(false, false, true, false);
+                    C32_FUSED_LAUNCH_NW(false, true, false);
             } else {
                 if (write_out)
-                    C32_FUSED_LAUNCH(false, false, false, true);
+                    C32_FUSED_LAUNCH_NW(false, false, true);
                 else
-                    C32_FUSED_LAUNCH(false, false, false, false);
+                    C32_FUSED_LAUNCH_NW(false, false, false);
             }
         }
     }
-    #undef C32_FUSED_LAUNCH
+    #undef C32_FUSED_ARGS
+    #undef C32_FUSED_LAUNCH_W
+    #undef C32_FUSED_LAUNCH_NW
 }
 
 // Production upstream MH chain (C64/128/256): FFN + p0 + QKV + norm in one kernel, then the

@@ -10,7 +10,10 @@ __device__ inline void c32_sync_window() { __syncthreads(); }
 __device__ inline void c32_wave_sync() { __syncthreads(); }
 } // namespace
 
-template <bool CHAIN, bool WINDOWED, bool WRITE_FFN, bool WRITE_OUT>
+// RASTER_IN: in_h is the raster f16 sibling (stride w) instead of the
+// window-major pack; the kernel reads it in place, zero outside the crop,
+// which is exactly what k_reframe_hin_hout would have written to s.a16.
+template <bool CHAIN, bool WINDOWED, bool WRITE_FFN, bool WRITE_OUT, bool RASTER_IN = false>
 __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8* ffn_w,
                                                     const float* ffn_s, const u8* qkv_w,
                                                     const float* qscale, const float* bias,
@@ -58,7 +61,16 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         const uint i4 = tid + it * 128u;
         tok[it] = i4 / 8u;
         c4s[it] = (i4 % 8u) * 4u;
-        hv[it] = *reinterpret_cast<const uint2*>(in_h + (window * 64u + tok[it]) * 32u + c4s[it]);
+        if constexpr (RASTER_IN) {
+            // Same window-space mapping and crop padding as k_reframe_hin_hout.
+            const uint x = (window % (sw / 8u)) * 8u + (tok[it] & 7u);
+            const uint y = (window / (sw / 8u)) * 8u + (tok[it] >> 3u);
+            hv[it] = (x >= px && y >= py && x < w + px && y < h + py)
+                         ? *reinterpret_cast<const uint2*>(
+                               in_h + (size_t)((y - py) * w + (x - px)) * 32u + c4s[it])
+                         : uint2{0u, 0u};
+        } else
+            hv[it] = *reinterpret_cast<const uint2*>(in_h + (window * 64u + tok[it]) * 32u + c4s[it]);
     }
 #pragma unroll
     for (uint it = 0; it < 4u; ++it) {
