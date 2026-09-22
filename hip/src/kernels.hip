@@ -265,6 +265,14 @@ void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint
         throw std::runtime_error("pool f16 extent/alias");
     LAUNCH(k_pool_f32, (ow * oh * c + 255) / 256, 256, src, dst, w, h, c, ow, oh, dst_h);
 }
+// The C32 pool inputs are the f16 window-major siblings (s.ah / skip byte copy),
+// remapped through the source block's (px,py) shift; values are f16-exact.
+void launch_pool_f16win_h(const __half* src, float* dst, __half* dst_h, uint w, uint h, uint c,
+                           uint ow, uint oh, uint sw, uint sh, uint px, uint py) {
+    if (!w || !h || w % 2 || h % 2 || ow < w / 2 || oh < h / 2 || !dst_h)
+        throw std::runtime_error("pool f16win extent/alias");
+    LAUNCH(k_pool_f16win_h, (ow * oh * c + 255) / 256, 256, src, dst, w, h, c, ow, oh, sw, sh, px, py, dst_h);
+}
 
 // Fat-M dispatch: one B-tile load per K step serves SUB 16-row subtiles per
 // wave. Same numerics as k_linear_f32 (identical K order, partitions,
@@ -742,11 +750,24 @@ void launch_up_f32(const float* lo,const float* skip,const float* scale,float* o
 void launch_up_f32_h(const float* lo,const float* skip,const float* scale,float* out,__half* out_h,uint iw,uint ih,uint ow,uint oh,uint c){
   if(!iw||!ih||ow>2*iw||oh>2*ih||out==lo||out==skip||!out_h)throw std::runtime_error("upsample f16 geometry/alias");LAUNCH(k_up_f32,(ow*oh*c+255)/256,256,lo,skip,scale,out,iw,ow,oh,c,out_h);
 }
+// The skip arrives as the C32 block's f16 window-major sibling (the skip byte
+// copy of s.ah): remap through the source block's (px,py) shift.
+void launch_up_f32_skip_h(const float* lo,const __half* skip,const float* scale,float* out,__half* out_h,
+                          uint iw,uint ih,uint ow,uint oh,uint c,uint sw,uint sh,uint px,uint py){
+  if(!iw||!ih||ow>2*iw||oh>2*ih||!out_h)throw std::runtime_error("upsample f16-skip geometry/alias");
+  LAUNCH(k_up_f32_skip_h,(ow*oh*c+255)/256,256,lo,skip,scale,out,iw,ow,oh,c,sw,sh,px,py,out_h);
+}
 void launch_copy_f32(const float* src,float* dst,size_t bytes){
   if(bytes%16)return;LAUNCH(k_copy_f32,(uint)((bytes/16+255u)/256u),256,src,dst,(uint)(bytes/16));
 }
 void launch_post_merge_f32(const float* lo,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32/8+255)/256,256,lo,pre,scales,out,w,h,main8_low);}
 void launch_post_merge_f32_h(const float* lo,const float* pre,const float* scales,float* out,__half* out_h,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32/8+255)/256,256,lo,pre,scales,out,w,h,main8_low,out_h);}
+// Both inputs are f16 window-major siblings (low: the last C32 block's s.ah,
+// pre: block 0's skip byte copy), each remapped through its (px,py) shift.
+void launch_post_merge_f16(const __half* low,const __half* pre,const float* scales,float* out,__half* out_h,
+                           uint w,uint h,uint lsw,uint lsh,uint lpx,uint lpy,uint psw,uint psh,uint ppix,uint ppy){
+  LAUNCH(k_post_merge_f16,(w*h*32/8+255)/256,256,low,pre,scales,out,w,h,lsw,lsh,lpx,lpy,psw,psh,ppix,ppy,out_h);
+}
 void launch_head_f32(const float* in,const float* w,const float* color,float* out,uint n){LAUNCH(k_head_f32,(n+63)/64,64,in,w,color,out,n);}
 // The head reads block 70's windowed f16 output directly: block 70's values sit on
 // the f16 grid (H() round), so the f16 read is bit-identical to the f32 raster
@@ -758,7 +779,7 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
                       const float* qscale, const float* bias, const u8* proj_w, const float* proj_s,
                       __half* ffn_h, __half* out_h, __half* out_h_raster, uint w, uint h, uint sw,
                       uint sh, uint px, uint py, bool chain, bool windowed, bool write_out,
-                      bool raster_in) {
+                      bool raster_in, bool in8, bool out8) {
     if (!in_h || !ffn_w || !ffn_s || !qkv_w || !qscale || !bias || !proj_w || !proj_s ||
         !out_h || sw % 8 || sh % 8 ||
         (windowed && (w + px > sw || h + py > sh)))
@@ -768,20 +789,23 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
     // raster_in only makes sense for windowed blocks: the prefix-fed window is
     // window-major (block 0).
     raster_in = raster_in && windowed;
+    in8 = in8 && raster_in;
+    out8 = out8 && out_h_raster != nullptr;
     #define C32_FUSED_LAUNCH_W(C, WR, WO)                                                      \
         do {                                                                                   \
             if (raster_in)                                                                     \
                 LAUNCH((k_c32_fused<C, true, WR, WO, true>), nwin, 128, in_h, ffn_w, ffn_s,    \
                        qkv_w, qscale, bias, proj_w, proj_s, ffn_h, out_h, out_h_raster, w, h,  \
-                       sw, sh, px, py);                                                       \
+                       sw, sh, px, py, in8, out8);                                            \
             else                                                                               \
                 LAUNCH((k_c32_fused<C, true, WR, WO, false>), nwin, 128, in_h, ffn_w, ffn_s,   \
                        qkv_w, qscale, bias, proj_w, proj_s, ffn_h, out_h, out_h_raster, w, h,  \
-                       sw, sh, px, py);                                                       \
+                       sw, sh, px, py, false, out8);                                          \
         } while (0)
     #define C32_FUSED_LAUNCH_NW(C, WR, WO)                                                     \
         LAUNCH((k_c32_fused<C, false, WR, WO, false>), nwin, 128, in_h, ffn_w, ffn_s, qkv_w,   \
-               qscale, bias, proj_w, proj_s, ffn_h, out_h, out_h_raster, w, h, sw, sh, px, py)
+               qscale, bias, proj_w, proj_s, ffn_h, out_h, out_h_raster, w, h, sw, sh, px, py, \
+               false, out8)
     if (chain) {
         if (windowed) {
             if (write_ffn) {

@@ -603,6 +603,35 @@ __global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c,
         dst_h[i] = __float2half_rn(v);
 }
 
+// Pool over a C32 block's f16 window-major sibling (its s.ah or the skip byte
+// copy): the 2x2 window reads go through the same (px,py)-shifted win/tok remap
+// as k_reframe_f32<HIN>. The values are f16-exact, so this is bit-identical to
+// k_pool_f32 on the reframed f32 raster.
+__global__ void k_pool_f16win_h(const __half* src, float* dst, uint w, uint h, uint c, uint ow, uint oh,
+                                uint sw, uint sh, uint px, uint py, __half* dst_h) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ow * oh * c) return;
+    uint ch = i % c, t = i / c, x = t % ow, y = t / ow;
+    float v;
+    if (x >= w / 2 || y >= h / 2) v = 0.f;
+    else {
+        auto at = [&](uint x2, uint y2) -> float {
+            uint wx = x2 + px, wy = y2 + py;
+            if (wx >= w + px || wy >= h + py) return 0.f;
+            uint win = (wy / 8u) * (sw / 8u) + wx / 8u;
+            uint tok = (wy % 8u) * 8u + wx % 8u;
+            return __half2float(src[(win * 64u + tok) * c + ch]);
+        };
+        float top = H(at(x * 2u, y * 2u) + at(x * 2u + 1u, y * 2u));
+        float bottom = H(at(x * 2u, y * 2u + 1u) + at(x * 2u + 1u, y * 2u + 1u));
+        v = from_e4m3(e4m3_byte(H(H(top + bottom) * .25f)));
+    }
+    if (dst)
+        dst[i] = v;
+    if (dst_h)
+        dst_h[i] = __float2half_rn(v);
+}
+
 // True half operands for ViT QKV, decoder entry and pool/head matrices.
 // partitions reproduce the fast shader's independent K reductions; ordered
 // rounds after each K32 only for the head/DS reference path.
@@ -707,6 +736,22 @@ __global__ void k_up_f32(const float* lo,const float* skip,const float* scale,fl
   if(out)out[i]=r;
   if(out_h)out_h[i]=__float2half_rn(r);
 }
+// Upsample with the skip as the C32 block's f16 window-major sibling (the skip
+// byte copy of s.ah): same (px,py)-shifted win/tok remap as k_head_f16. The
+// e4m3 re-quantize hits the same bytes as the f32 path (bit-identical to
+// k_up_f32 on the reframed f32 copy).
+__global__ void k_up_f32_skip_h(const float* lo,const __half* skip,const float* scale,float* out,
+                                uint iw,uint ow,uint oh,uint c,uint sw,uint sh,uint px,uint py,__half* out_h){
+  uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=ow*oh*c)return;
+  uint ch=i%c,p=i/c,x=p%ow,y=p/ow;
+  uint wx=x+px,wy=y+py;
+  uint win=(wy/8u)*(sw/8u)+wx/8u;
+  uint tok=(wy%8u)*8u+wx%8u;
+  float v=H(lo[((y/2)*iw+x/2)*c+ch]+from_e4m3(e4m3_byte(__half2float(skip[(win*64u+tok)*c+ch])))*scale[ch]);
+  float r=c==32?v:from_e4m3(e4m3_byte(v));
+  if(out)out[i]=r;
+  if(out_h)out_h[i]=__float2half_rn(r);
+}
 // v ends on the f16 grid (outer H round). When the f16 sibling is published
 // (out_h != null) the f32 write is pure traffic: no consumer reads it (block 70
 // takes the f16 path, the head reads the f16 raster), so skip it.
@@ -738,6 +783,52 @@ __global__ void k_post_merge_f32(const float* low,const float* pre,const float* 
   v1.y=H(H(lo1.y*scales[ch+5u])+from_e4m3(e4m3_byte(pr1.y))*scales[32u+ch+5u]);
   v1.z=H(H(lo1.z*scales[ch+6u])+from_e4m3(e4m3_byte(pr1.z))*scales[32u+ch+6u]);
   v1.w=H(H(lo1.w*scales[ch+7u])+from_e4m3(e4m3_byte(pr1.w))*scales[32u+ch+7u]);
+  if(!out_h){
+    *reinterpret_cast<float4*>(out+i8)=v0;
+    *reinterpret_cast<float4*>(out+i8+4)=v1;
+  }
+  if(out_h){
+    __half2 h0=__floats2half2_rn(v0.x,v0.y),h1=__floats2half2_rn(v0.z,v0.w),
+            h2=__floats2half2_rn(v1.x,v1.y),h3=__floats2half2_rn(v1.z,v1.w);
+    uint4 o;
+    o.x=*reinterpret_cast<const uint*>(&h0);
+    o.y=*reinterpret_cast<const uint*>(&h1);
+         o.z=*reinterpret_cast<const uint*>(&h2);
+    o.w=*reinterpret_cast<const uint*>(&h3);
+    *reinterpret_cast<uint4*>(out_h+i8)=o;
+  }
+}
+// post_merge over the f16 window-major siblings: low = the last C32 block's
+// s.ah (win/tok with its (px,py) shift), pre = block 0's skip byte copy. Both
+// are f16-exact, so the e4m3 re-quantize hits the same bytes as the f32 path
+// (bit-identical to k_post_merge_f32 with main8_low=true). The f32 raster
+// output has no consumer, so only the f16 publish is written.
+__global__ void k_post_merge_f16(const __half* low,const __half* pre,const float* scales,float* out,
+                                 uint w,uint h,uint lsw,uint lsh,uint lpx,uint lpy,
+                                 uint psw,uint psh,uint ppix,uint ppy,__half* out_h){
+  uint i8=(blockIdx.x*blockDim.x+threadIdx.x)*8u;if(i8+8u>w*h*32u)return;
+  uint ch=i8&31u,p=i8/32u;
+  uint lx=(p%w)/2u,ly=(p/w)/2u;
+  uint lwx=lx+lpx,lwy=ly+lpy;
+  uint lwin=(lwy/8u)*(lsw/8u)+lwx/8u,ltok=(lwy%8u)*8u+lwx%8u;
+  uint pwx=(p%w)+ppix,pwy=(p/w)+ppy;
+  uint pwin=(pwy/8u)*(psw/8u)+pwx/8u,ptok=(pwy%8u)*8u+pwx%8u;
+  const __half* lp=low+(lwin*64u+ltok)*32u+ch;
+  const __half* pp=pre+(pwin*64u+ptok)*32u+ch;
+  auto rq=[]__device__(const __half* t)->float{return from_e4m3(e4m3_byte(__half2float(t[0])));};
+  float4 lo0=make_float4(rq(lp+0),rq(lp+1),rq(lp+2),rq(lp+3));
+  float4 lo1=make_float4(rq(lp+4),rq(lp+5),rq(lp+6),rq(lp+7));
+  float4 pr0=make_float4(rq(pp+0),rq(pp+1),rq(pp+2),rq(pp+3));
+  float4 pr1=make_float4(rq(pp+4),rq(pp+5),rq(pp+6),rq(pp+7));
+  float4 v0,v1;
+  v0.x=H(H(lo0.x*scales[ch])+pr0.x*scales[32u+ch]);
+  v0.y=H(H(lo0.y*scales[ch+1u])+pr0.y*scales[32u+ch+1u]);
+  v0.z=H(H(lo0.z*scales[ch+2u])+pr0.z*scales[32u+ch+2u]);
+  v0.w=H(H(lo0.w*scales[ch+3u])+pr0.w*scales[32u+ch+3u]);
+  v1.x=H(H(lo1.x*scales[ch+4u])+pr1.x*scales[32u+ch+4u]);
+  v1.y=H(H(lo1.y*scales[ch+5u])+pr1.y*scales[32u+ch+5u]);
+  v1.z=H(H(lo1.z*scales[ch+6u])+pr1.z*scales[32u+ch+6u]);
+  v1.w=H(H(lo1.w*scales[ch+7u])+pr1.w*scales[32u+ch+7u]);
   if(!out_h){
     *reinterpret_cast<float4*>(out+i8)=v0;
     *reinterpret_cast<float4*>(out+i8+4)=v1;

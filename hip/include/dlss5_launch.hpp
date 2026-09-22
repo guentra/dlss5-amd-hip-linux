@@ -85,7 +85,9 @@ void launch_reframe_hin_hout(const __half* src, __half* dst, uint w, uint h, uin
                              uint px, uint py, uint c);
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh);
 void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint h, uint c,
-                       uint ow, uint oh);
+                        uint ow, uint oh);
+void launch_pool_f16win_h(const __half* src, float* dst, __half* dst_h, uint w, uint h, uint c,
+                           uint ow, uint oh, uint sw, uint sh, uint px, uint py);
 void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, float* out, uint tokens,
                     bool chain_residual = false, bool precise_c32 = false);
 void launch_vit_ffn_fused(const float* in, const u8* w_expand, const u8* w_contract,
@@ -148,9 +150,11 @@ void launch_rgb_graph(const float*,float*,float*,uint w,uint h,uint ow,uint oh);
 void launch_gather_f32(const float*,const int*,float*,uint n);
 void launch_up_f32(const float*,const float*,const float*,float*,uint iw,uint ih,uint ow,uint oh,uint c);
 void launch_up_f32_h(const float*,const float*,const float*,float*,__half*,uint iw,uint ih,uint ow,uint oh,uint c);
+void launch_up_f32_skip_h(const float*,const __half*,const float*,float*,__half*,uint iw,uint ih,uint ow,uint oh,uint c,uint sw,uint sh,uint px,uint py);
 void launch_copy_f32(const float* src,float* dst,size_t bytes);
 void launch_post_merge_f32(const float*,const float*,const float*,float*,uint w,uint h,bool main8_low = false);
 void launch_post_merge_f32_h(const float*,const float*,const float*,float*,__half*,uint w,uint h,bool main8_low);
+void launch_post_merge_f16(const __half*,const __half*,const float*,float*,__half*,uint w,uint h,uint lsw,uint lsh,uint lpx,uint lpy,uint psw,uint psh,uint ppix,uint ppy);
 void launch_head_f32(const float*,const float*,const float*,float*,uint n);
 void launch_head_f16(const __half*,const float*,const float*,float*,uint wsize,uint hsize,uint sw,uint sh,uint px,uint py);
 void launch_trace_f32(const float*,uint n,float*,uint*);
@@ -158,7 +162,7 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
                       const float* qscale, const float* bias, const u8* proj_w, const float* proj_s,
                       __half* ffn_h, __half* out_h, __half* out_h_raster, uint w, uint h, uint sw,
                       uint sh, uint px, uint py, bool chain, bool windowed, bool write_out = true,
-                      bool raster_in = false);
+                      bool raster_in = false, bool in8 = false, bool out8 = false);
 void launch_c32_prod(const __half* in_h, const float* fw, const float* wgt, __half* out_h,
                      __half* out_h_raster, uint w, uint h, uint sw, uint sh, uint px, uint py,
                      bool chain);

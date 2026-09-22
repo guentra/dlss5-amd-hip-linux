@@ -126,7 +126,7 @@ struct Block {
  // Residuals remain distinct from quantized matrix operands.
    void window(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
                const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true,
-               bool raster_f16=true,bool in_h_raster=false){
+               bool raster_f16=true,bool in_h_raster=false,bool in8=false,bool out8=false){
     uint n=sw*sh;float* f=s.b.as<float>();
       unsigned char* dbg_hidden=nullptr;
       {const char* ds1=getenv("DLSS5_DUMP_SCRATCH");if(ds1&&c==64&&id==atoi(ds1)&&in_h){hip_check(hipMalloc(&dbg_hidden,size_t(n)*4*c),"dbg_h1");}}
@@ -141,11 +141,18 @@ struct Block {
        if(c==32 && in_h && !(std::getenv("DLSS5_C32_SPLIT") && std::string(std::getenv("DLSS5_C32_SPLIT")) == "1")){
         const bool write_ffn = std::getenv("DLSS5_C32_FFN_OUT") &&
                                std::string(std::getenv("DLSS5_C32_FFN_OUT")) != "0";
+         // f8 chain: the e4m3 raster must not alias the f16 raster buffer
+         // (s.out16): e4m3 (1B/channel) and f16 (2B/channel) pack different
+         // pixels into the same bytes, so one CTA's output write can destroy
+         // another CTA's not-yet-read input. Publish on the dedicated e4m3
+         // buffer (s.f8) instead.
+         __half* out_raster = raster_f16 ? s.out16.as<__half>() : nullptr;
+         if (out8) out_raster = reinterpret_cast<__half*>(s.f8.p);
          launch_c32_fused(in_h, ffn_rw.as<u8>(), fs.as<float>(), qw_rw.as<u8>(), qs.as<float>(),
                           bias.as<float>(), p1_rw.as<u8>(), s1.as<float>(),
                          write_ffn ? s.bh.as<__half>() : nullptr, s.ah.as<__half>(),
-                         raster_f16 ? s.out16.as<__half>() : nullptr, w, h, sw, sh, px, py,
-                         chain, windowed, write_f32_out, in_h_raster);
+                         out_raster, w, h, sw, sh, px, py,
+                         chain, windowed, write_f32_out, in_h_raster, in8, out8);
        return;
       }
       const char* mh_prod = std::getenv("DLSS5_MH_PROD");
@@ -222,7 +229,7 @@ struct Block {
     }
   void run(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
            const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true,
-           bool input_f16_exact=false,bool raster_f16=true){
+           bool input_f16_exact=false,bool raster_f16=true,bool in8=false,bool out8=false){
     bool use_h = in_h || (c==32 && input_f16_exact);
     bool use_f8 = c!=32 && in_f8 && !use_h;
     // The default C32 fused kernel reads the raster f16 sibling in place
@@ -240,7 +247,7 @@ struct Block {
     else launch_reframe_f32(in,s.a.as<float>(),w,h,sw,sh,px,py,c,0,0);
      window(use_h||use_f8?in:s.a.as<float>(),s.a.as<float>(),s,use_f8?s.a8.as<u8>():nullptr,emit_f8,
             c32_raster_in?in_h:(use_h?s.a16.as<__half>():nullptr),emit_h,write_f32_out,raster_f16,
-            c32_raster_in);
+            c32_raster_in,in8,out8);
     if(const char* dump=std::getenv("DLSS5_DUMP_F8")){
      if(id>=0&&c==64){
       uint n2=sw*sh;std::vector<u8> d(size_t(n2)*c);
@@ -288,7 +295,15 @@ struct Vit {
 struct Up {
  uint iw,ih,ow,oh,cin,cout;DeviceBuf wt,sc;
  void create(const std::string&dir,const std::string&name,uint w,uint h,uint width,uint height,uint ic,uint oc){iw=w;ih=h;ow=width;oh=height;cin=ic;cout=oc;auto v=load(dir,name,size_t(ic)*oc+oc);wt=row_half_matrix(v.data(),oc,ic);sc=floats(v.data()+size_t(ic)*oc,oc);}
-  void run(const float* in,const float* skip,float* out,Scratch&s,__half* out_h=nullptr){launch_linear_half_out(in,wt.as<__half>(),s.d.as<float>(),iw*ih,cout,cin,cin==1024?4:1,0,1);if(out_h)launch_up_f32_h(s.d.as<float>(),skip,sc.as<float>(),out,out_h,iw,ih,ow,oh,cout);else launch_up_f32(s.d.as<float>(),skip,sc.as<float>(),out,iw,ih,ow,oh,cout);}
+  // skip_f16: the skip is the source C32 block's f16 window-major sibling (the
+  // skip byte copy of its s.ah); sw/sh/px/py are that block's window geometry.
+  void run(const float* in,const float* skip,float* out,Scratch&s,__half* out_h=nullptr,
+           bool skip_f16=false,uint sw=0,uint sh=0,uint px=0,uint py=0){
+    launch_linear_half_out(in,wt.as<__half>(),s.d.as<float>(),iw*ih,cout,cin,cin==1024?4:1,0,1);
+    if(skip_f16)launch_up_f32_skip_h(s.d.as<float>(),reinterpret_cast<const __half*>(skip),sc.as<float>(),out,out_h,iw,ih,ow,oh,cout,sw,sh,px,py);
+    else if(out_h)launch_up_f32_h(s.d.as<float>(),skip,sc.as<float>(),out,out_h,iw,ih,ow,oh,cout);
+    else launch_up_f32(s.d.as<float>(),skip,sc.as<float>(),out,iw,ih,ow,oh,cout);
+  }
 };
 }
 struct Network70::Impl {
@@ -349,28 +364,47 @@ struct Network70::Impl {
      launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
    }
   launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
-    // Block 0's f16 raster sibling is dead: skip[0] comes from the f16 window
-    // (reframe below) and the pool overwrites s.out16 before anything reads it.
+    // Block 0's f16 raster sibling is dead: the pool/post-merge consumers read the
+    // f16 window bytes directly, so skip[0] is a plain byte move of s.ah (the f32
+    // reframe only remains for the trace path).
     blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false,true,false);
-   // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
-   launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
-  float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
-  launch_pool_f32_h(skip[0].as<float>(),nullptr,s.out16.as<__half>(),W,Ht,32,960,576);
+    launch_copy_f32(s.ah.as<float>(),skip[0].as<float>(),size_t(W)*Ht*32*2);
+    float* mark0=skip[0].as<float>();
+    if(tracing){launch_reframe_f32_hin(s.ah.as<__half>(),raster[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark0=raster[0].as<float>();}
+    mark(0,mark0,N*32);
+   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
+   launch_pool_f16win_h(skip[0].as<__half>(),nullptr,s.out16.as<__half>(),W,Ht,32,960,576,W,Ht,0,0);
   const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;
   const __half* group_in_h=s.out16.as<__half>();
    for(int g=0;g<5;++g){
-   const u8* in_f8=nullptr; const __half* in_h=group_in_h;
-    for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];
-     // A c32 group's last block publishes the f32 raster (pool/skip read it); its
-     // f16 raster sibling has no consumer, so skip the scattered write.
-     b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false,!(b.c==32&&j+1==num[g]));std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
+   const u8* in_f8=nullptr; const __half* in_h=group_in_h; bool c32_in8=false;
+     for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;
+      // A c32 group's last block keeps its f16 window sibling (the pool/skip
+      // readers take it directly) but no longer publishes the f32 raster; other
+      // last blocks publish the f32 raster the pool reads. Its f16 raster
+      // sibling has no consumer, so skip the scattered write.
+      // f8 chain: a block publishes the e4m3 raster when the next block re-quantizes
+      // the input anyway (CHAIN), saving the f16 write and the input re-quant.
+      bool write_f32=tracing||(b.c!=32&&j+1==num[g]);
+      const bool keep_win=write_f32||(b.c==32&&j+1==num[g]);
+      const bool rf16=!(b.c==32&&j+1==num[g]);
+      const int nid=first[g]+j+1;
+      const bool c32_out8=b.c==32&&rf16&&(nid==2||nid==3||nid==4||nid==67||nid==68||nid==69);
+      b.run(src,write_f32?dst:nullptr,s,in_f8,emit_f8,in_h,emit_h,keep_win,false,rf16,c32_in8,c32_out8);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?(c32_out8?reinterpret_cast<const __half*>(s.f8.p):s.out16.as<__half>()):nullptr;c32_in8=c32_out8;}
     // Kernel copy instead of hipMemcpyAsync: bit-identical (pure byte move),
     // keeps the skip path on the same launch stream/queue as the kernels and
-    // avoids the driver copy-engine submission.
-    launch_copy_f32(src,skip[g+1].as<float>(),size_t(w)*h*c*4);
+    // avoids the driver copy-engine submission. The C32 group publishes its skip
+    // as the f16 window bytes and pools the f16 window directly.
     uint ow=g==4?32:w/2,oh=g==4?20:h/2;
-     if(g<4){launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin_out(s.a16.as<__half>(),ds[g].as<__half>(),nullptr,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);}
-     else{launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin_out(s.a16.as<__half>(),head_w.as<__half>(),dst,nullptr,ow*oh,c*2,c,1,1,0);}
+    if(c==32){auto&lb=blocks[first[g]+num[g]-1];
+      launch_copy_f32(s.ah.as<float>(),skip[g+1].as<float>(),size_t(lb.sw)*lb.sh*lb.c*2);
+      launch_pool_f16win_h(s.ah.as<__half>(),nullptr,s.a16.as<__half>(),lb.w,lb.h,lb.c,ow,oh,lb.sw,lb.sh,lb.px,lb.py);
+    }else{
+      launch_copy_f32(src,skip[g+1].as<float>(),size_t(w)*h*c*4);
+      launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);
+    }
+     if(g<4){launch_linear_half_hin_out(s.a16.as<__half>(),ds[g].as<__half>(),nullptr,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);}
+     else{launch_linear_half_hin_out(s.a16.as<__half>(),head_w.as<__half>(),dst,nullptr,ow*oh,c*2,c,1,1,0);}
     group_in_h=g<4?s.out16.as<__half>():nullptr;
     std::swap(src,dst);w=ow;h=oh;c*=2;
   }
@@ -380,13 +414,23 @@ struct Network70::Impl {
   up[0].run(src,skip[5].as<float>(),tracing?dst:nullptr,s,s.out16.as<__half>());std::swap(src,dst);mark(39,src,60*36*512);
   const __half* dec_group_in_h=s.out16.as<__half>();
    const int decfirst[]={40,48,56,62,66},decnum[]={8,8,6,4,4};
-   for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),nullptr,s,s.out16.as<__half>());std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
-    const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h;
-    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];
-     // Same dead f16 raster sibling as the encoder group: only the f32 raster
-     // (post_merge's low input) is consumed after the last c32 block.
-     b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false,!(b.c==32&&j+1==decnum[g]));std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
-  launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),dst,s.out16.as<__half>(),W,Ht,true);std::swap(src,dst);
+    for(int g=0;g<5;++g){if(g){
+      // up[4]'s skip is block 4's f16 window sibling (skip[1] byte copy).
+      if(g==4)up[4].run(src,skip[1].as<float>(),nullptr,s,s.out16.as<__half>(),true,blocks[4].sw,blocks[4].sh,blocks[4].px,blocks[4].py);
+      else up[g].run(src,skip[5-g].as<float>(),nullptr,s,s.out16.as<__half>());
+      std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
+     const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h; bool c32_in8=false;
+     for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;
+      bool write_f32=tracing||(b.c!=32&&j+1==decnum[g]);
+      const bool keep_win=write_f32||(b.c==32&&j+1==decnum[g]);
+      const bool rf16=!(b.c==32&&j+1==decnum[g]);
+      const int nid=decfirst[g]+j+1;
+      const bool c32_out8=b.c==32&&rf16&&(nid==2||nid==3||nid==4||nid==67||nid==68||nid==69);
+      b.run(src,write_f32?dst:nullptr,s,in_f8,emit_f8,in_h,emit_h,keep_win,false,rf16,c32_in8,c32_out8);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?(c32_out8?reinterpret_cast<const __half*>(s.f8.p):s.out16.as<__half>()):nullptr;c32_in8=c32_out8;}}
+   // post_merge reads the f16 window siblings directly: low = block 69's s.ah,
+   // pre = block 0's skip byte copy. Both are f16-exact (the e4m3 re-quantize
+   // hits the same bytes as the f32 path); the f32 raster output is dead.
+   launch_post_merge_f16(s.ah.as<__half>(),skip[0].as<__half>(),post_sc.as<float>(),nullptr,s.out16.as<__half>(),W,Ht,blocks[69].sw,blocks[69].sh,blocks[69].px,blocks[69].py,W,Ht,0,0);std::swap(src,dst);
   // block 70 publishes only the f16 sibling: the f32 raster write of post_merge and
   // the reframe were dead traffic (block 70 reads the f16 chain, the head reads the
   // f16 window output; both are f16-exact). Tracing still materializes the f32 raster.

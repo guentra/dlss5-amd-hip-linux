@@ -18,9 +18,9 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                                                     const float* ffn_s, const u8* qkv_w,
                                                     const float* qscale, const float* bias,
                                                     const u8* proj_w, const float* proj_s,
-                                                    __half* ffn_h, __half* out_h,
-                                                    __half* out_h_raster, uint w, uint h, uint sw,
-                                                    uint sh, uint px, uint py) {
+                                                     __half* ffn_h, __half* out_h,
+                                                     __half* out_h_raster, uint w, uint h, uint sw,
+                                                     uint sh, uint px, uint py, bool in8, bool out8) {
     using i2 = int __attribute__((ext_vector_type(2)));
     using f8 = float __attribute__((ext_vector_type(8)));
     constexpr uint PACKED_BYTES = 3u * 64u * 36u;
@@ -54,34 +54,82 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     const float ps1 = proj_s[16u + rc];
     const float q0s = qscale[0];
 
-    uint2 hv[4];
-    uint tok[4], c4s[4];
+    if constexpr (RASTER_IN) {
+        if (in8) {
+            // f8 chain: the previous block published the e4m3 bytes already
+            // quantized (it is the same byte this prologue would produce), so
+            // they go straight into packed without the f16 round trip.
+            const u8* in8p = reinterpret_cast<const u8*>(in_h);
 #pragma unroll
-    for (uint it = 0; it < 4u; ++it) {
-        const uint i4 = tid + it * 128u;
-        tok[it] = i4 / 8u;
-        c4s[it] = (i4 % 8u) * 4u;
-        if constexpr (RASTER_IN) {
-            // Same window-space mapping and crop padding as k_reframe_hin_hout.
-            const uint x = (window % (sw / 8u)) * 8u + (tok[it] & 7u);
-            const uint y = (window / (sw / 8u)) * 8u + (tok[it] >> 3u);
-            hv[it] = (x >= px && y >= py && x < w + px && y < h + py)
-                         ? *reinterpret_cast<const uint2*>(
-                               in_h + (size_t)((y - py) * w + (x - px)) * 32u + c4s[it])
-                         : uint2{0u, 0u};
-        } else
+            for (uint it = 0; it < 4u; ++it) {
+                const uint i4 = tid + it * 128u;
+                const uint tok = i4 / 8u;
+                const uint c4s = (i4 % 8u) * 4u;
+                const uint x = (window % (sw / 8u)) * 8u + (tok & 7u);
+                const uint y = (window / (sw / 8u)) * 8u + (tok >> 3u);
+                // Out-of-crop tokens read zero, exactly as the f16 path pads
+                // packed: the stale LDS bytes would otherwise leak into the
+                // window attention of the in-crop edge rows.
+                if (x >= px && y >= py && x < w + px && y < h + py)
+                    *reinterpret_cast<u32*>(packed + tok * 36u + c4s) =
+                        *reinterpret_cast<const uint*>(
+                            in8p + (size_t)((y - py) * w + (x - px)) * 32u + c4s);
+                else
+                    *reinterpret_cast<u32*>(packed + tok * 36u + c4s) = 0u;
+            }
+        } else {
+            uint2 hv[4];
+            uint tok[4], c4s[4];
+#pragma unroll
+            for (uint it = 0; it < 4u; ++it) {
+                const uint i4 = tid + it * 128u;
+                tok[it] = i4 / 8u;
+                c4s[it] = (i4 % 8u) * 4u;
+                // Same window-space mapping and crop padding as k_reframe_hin_hout.
+                const uint x = (window % (sw / 8u)) * 8u + (tok[it] & 7u);
+                const uint y = (window / (sw / 8u)) * 8u + (tok[it] >> 3u);
+                hv[it] = (x >= px && y >= py && x < w + px && y < h + py)
+                             ? *reinterpret_cast<const uint2*>(
+                                   in_h + (size_t)((y - py) * w + (x - px)) * 32u + c4s[it])
+                             : uint2{0u, 0u};
+            }
+#pragma unroll
+            for (uint it = 0; it < 4u; ++it) {
+                const __half2* hp = reinterpret_cast<const __half2*>(&hv[it]);
+                if constexpr (!CHAIN) {
+                    // CHAIN blocks re-quantize the input anyway and read the bytes
+                    // from packed, so their f16 residual store is dead.
+                    *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it]) = hp[0];
+                    *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it] + 2u) = hp[1];
+                }
+                *reinterpret_cast<u32*>(packed + tok[it] * 36u + c4s[it]) =
+                    u32(e4m3_byte_fast(__half2float(__low2half(hp[0])))) |
+                    u32(e4m3_byte_fast(__half2float(__high2half(hp[0])))) << 8 |
+                    u32(e4m3_byte_fast(__half2float(__low2half(hp[1])))) << 16 |
+                    u32(e4m3_byte_fast(__half2float(__high2half(hp[1])))) << 24;
+            }
+        }
+    } else {
+        uint2 hv[4];
+        uint tok[4], c4s[4];
+#pragma unroll
+        for (uint it = 0; it < 4u; ++it) {
+            const uint i4 = tid + it * 128u;
+            tok[it] = i4 / 8u;
+            c4s[it] = (i4 % 8u) * 4u;
             hv[it] = *reinterpret_cast<const uint2*>(in_h + (window * 64u + tok[it]) * 32u + c4s[it]);
-    }
+        }
 #pragma unroll
-    for (uint it = 0; it < 4u; ++it) {
-        const __half2* hp = reinterpret_cast<const __half2*>(&hv[it]);
-        *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it]) = hp[0];
-        *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it] + 2u) = hp[1];
-        *reinterpret_cast<u32*>(packed + tok[it] * 36u + c4s[it]) =
-            u32(e4m3_byte_fast(__half2float(__low2half(hp[0])))) |
-            u32(e4m3_byte_fast(__half2float(__high2half(hp[0])))) << 8 |
-            u32(e4m3_byte_fast(__half2float(__low2half(hp[1])))) << 16 |
-            u32(e4m3_byte_fast(__half2float(__high2half(hp[1])))) << 24;
+        for (uint it = 0; it < 4u; ++it) {
+            const __half2* hp = reinterpret_cast<const __half2*>(&hv[it]);
+            *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it]) = hp[0];
+            *reinterpret_cast<__half2*>(in16 + tok[it] * 34u + c4s[it] + 2u) = hp[1];
+            *reinterpret_cast<u32*>(packed + tok[it] * 36u + c4s[it]) =
+                u32(e4m3_byte_fast(__half2float(__low2half(hp[0])))) |
+                u32(e4m3_byte_fast(__half2float(__high2half(hp[0])))) << 8 |
+                u32(e4m3_byte_fast(__half2float(__low2half(hp[1])))) << 16 |
+                u32(e4m3_byte_fast(__half2float(__high2half(hp[1])))) << 24;
+        }
     }
     c32_sync_window();
 
@@ -107,11 +155,16 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
 #pragma unroll
     for (uint i = 0; i < 8u; ++i) {
         uint2 rc2 = acc0.GetCoordinate(i);
-        float iv0 = __half2float(in16[(first + rc2.x) * 34u + rc2.y]);
-        float iv1 = __half2float(in16[(first + rc2.x) * 34u + 16u + rc2.y]);
+        float iv0, iv1;
         if constexpr (CHAIN) {
-            iv0 = from_e4m3(e4m3_byte_fast(iv0));
-            iv1 = from_e4m3(e4m3_byte_fast(iv1));
+            // The e4m3 quantized input is already in packed: the same bytes
+            // e4m3_byte_fast of the f16 input produces.
+            const u8* pk = packed + (first + rc2.x) * 36u + rc2.y;
+            iv0 = from_e4m3(pk[0]);
+            iv1 = from_e4m3(pk[16]);
+        } else {
+            iv0 = __half2float(in16[(first + rc2.x) * 34u + rc2.y]);
+            iv1 = __half2float(in16[(first + rc2.x) * 34u + 16u + rc2.y]);
         }
         acc0.Set(i, iv0 * fs0);
         acc1.Set(i, iv1 * fs1);
@@ -201,6 +254,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         }
         c32_sync_window();
     }
+    // One barrier: QK below reads K and V rows written by the other waves.
     c32_sync_window();
 
     {
@@ -254,6 +308,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             row[q4] = p8r[q4];
     }
     c32_sync_window();
+    // p8 rows are wave-owned; V rows were published by the barrier above.
 
     {
         using namespace linalg;
@@ -295,9 +350,17 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                 if constexpr (WINDOWED) {
                     uint x = (window % (sw / 8u)) * 8u + (row % 8u);
                     uint y = (window / (sw / 8u)) * 8u + (row / 8u);
-                    if (x >= px && y >= py && x < w + px && y < h + py)
-                        out_h_raster[((y - py) * w + (x - px)) * 32u + rc2.y] = hv;
-                } else
+                    if (x >= px && y >= py && x < w + px && y < h + py) {
+                        const size_t off = ((y - py) * w + (x - px)) * 32u + rc2.y;
+                        if (out8)
+                            reinterpret_cast<u8*>(out_h_raster)[off] = e4m3_byte_fast(hv);
+                        else
+                            out_h_raster[off] = hv;
+                    }
+                } else if (out8)
+                    reinterpret_cast<u8*>(out_h_raster)[(window * 64u + row) * 32u + rc2.y] =
+                        e4m3_byte_fast(hv);
+                else
                     out_h_raster[(window * 64u + row) * 32u + rc2.y] = hv;
             }
         }
@@ -313,9 +376,17 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                 if constexpr (WINDOWED) {
                     uint x = (window % (sw / 8u)) * 8u + (row % 8u);
                     uint y = (window / (sw / 8u)) * 8u + (row / 8u);
-                    if (x >= px && y >= py && x < w + px && y < h + py)
-                        out_h_raster[((y - py) * w + (x - px)) * 32u + 16u + rc2.y] = hv;
-                } else
+                    if (x >= px && y >= py && x < w + px && y < h + py) {
+                        const size_t off = ((y - py) * w + (x - px)) * 32u + 16u + rc2.y;
+                        if (out8)
+                            reinterpret_cast<u8*>(out_h_raster)[off] = e4m3_byte_fast(hv);
+                        else
+                            out_h_raster[off] = hv;
+                    }
+                } else if (out8)
+                    reinterpret_cast<u8*>(out_h_raster)[(window * 64u + row) * 32u + 16u + rc2.y] =
+                        e4m3_byte_fast(hv);
+                else
                     out_h_raster[(window * 64u + row) * 32u + 16u + rc2.y] = hv;
             }
         }
