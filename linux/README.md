@@ -16,8 +16,9 @@ With the game closed, extract `dlss5-amd-hip-linux.tar.gz` inside its directory,
 keep the extracted subfolder, and run `./install.sh` there. The wizard asks for
 the executable, existing runner and weights. Steam is optional.
 
-Requirements: Linux x86_64, Python 3.10+, RDNA 4 `gfx1201`, ROCm/HIP 7 and a
-compatible Wine/Proton runner. The native ROCm runtime is not included or installed
+Requirements: Linux x86_64, Python 3.10+, RDNA 4 `gfx1200` (RX 9060) or
+`gfx1201` (RX 9070), ROCm/HIP 7 and a
+compatible Wine/Proton runner. `gfx1200` is untested and may simply not work. The native ROCm runtime is not included or installed
 automatically. No anti-cheat games. The archive includes the ReShade 6.8 add-on
 loader, native `.so` and PE bridge; compilers are not required to use it.
 

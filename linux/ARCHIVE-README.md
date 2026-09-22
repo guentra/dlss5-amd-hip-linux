@@ -1,7 +1,8 @@
 # DLSS5-AMD HIP — Linux proof of concept
 
-Prebuilt native HIP network, Wine bridge and ReShade add-on for `gfx1201`.
-No HIP or MinGW compiler is needed to use this archive.
+Prebuilt native HIP network, Wine bridge and ReShade add-on for `gfx1200`
+(RX 9060) and `gfx1201` (RX 9070). No HIP or MinGW compiler is needed to use
+this archive.
 
 **This is a slow proof of concept requiring substantial optimization, not a
 production-ready gaming mod.** The live hook uses the included modified vkd3d
