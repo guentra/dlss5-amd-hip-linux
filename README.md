@@ -6,7 +6,7 @@ A native Linux HIP/rocWMMA implementation of the complete 71-block DLSS5 network
 
 ## Download and install
 
-**[Download v0.2.6 .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.6/dlss5-amd-hip-linux.tar.gz)** · [SHA256](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.6/dlss5-amd-hip-linux.tar.gz.sha256) · [Release notes](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.6)
+**[Download v0.2.6.1 .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.6.1/dlss5-amd-hip-linux.tar.gz)** · [SHA256](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.6.1/dlss5-amd-hip-linux.tar.gz.sha256) · [Release notes](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.6.1)
 
 1. Close the game. Extract the archive inside its directory, keeping the `dlss5-amd-hip-linux` subfolder.
 2. Put your legitimately obtained `nvngx_dlssnr.dll` **310.8.0.0** beside the game executable or in the game root (or select it in the wizard).
@@ -24,7 +24,7 @@ The archive contains the prebuilt HIP library, Windows bridge, add-on, ReShade l
 - The prototype uses CPU readback/upload and HIP execution at a split vkd3d submission boundary. **The game still waits for neural rendering.** It is not an asynchronous performance fix.
 - General gameplay stability, HDR behavior and broad game compatibility are not certified. F6 toggles the live path's bypass when the hook is active; it cannot fix a missing hook or failed initialization.
 
-The offline bench (network only, fixed 1080p input, real converted weights, RX 9070 XT `gfx1201`, warm runs) measures **~25 ms GPU time per inference** on the current `0.2.6` build (`0.2.5` ~33 ms, `0.2.3` ~63–66 ms, `0.2.1` ~98–105 ms, `0.1.0-poc` 210–216 ms). That is network-only timing, **not in-game FPS**: in-game SILENT HILL f runs at **~28 fps** on `0.2.6` (up from ~25 fps on `0.2.5`, 15–20 fps on `0.2.3`). Kernel work is tracked in the [Changelog](#changelog); data transfers and memory use remain open targets.
+The offline bench (network only, fixed 1080p input, real converted weights, RX 9070 XT `gfx1201`, warm runs) measures **~25 ms GPU time per inference** on the current `0.2.6.1` build (`0.2.5` ~33 ms, `0.2.3` ~63–66 ms, `0.2.1` ~98–105 ms, `0.1.0-poc` 210–216 ms). That is network-only timing, **not in-game FPS**: in-game SILENT HILL f runs at **~28 fps** on `0.2.6.1` (up from ~25 fps on `0.2.5`, 15–20 fps on `0.2.3`). Kernel work is tracked in the [Changelog](#changelog); data transfers and memory use remain open targets.
 
 ## Changelog
 
@@ -40,6 +40,7 @@ Unless a scenario is specified, timings are the offline bench (network only, fix
 | `0.2.4` | 09-20 | live path: gated-less temporal blend `out=(1−w)·prev+w·cur` (`DLSS5_TEMPORAL_BLEND`) fixes shimmer; byte-exact fused C64/C128/C256 MH-prod chain on by default | bench ~63–66 → ~50 ms, bit-identical |
 | `0.2.5` | 09-21 | frame-difference-gated blend weight (anti-ghosting, `DLSS5_TEMPORAL_BLEND_GATE`); post-70 f16 chain (dead f32 raster dropped); installer UX (overwrite prompt, weights consent, progress); legacy FSR3 dispatch route (PR #4); CI + live test suite fixes | in-game SHf ~25 fps; bench ~33 ms, bit-identical (16/16) |
 | `0.2.6` | 09-22 | dual-arch build for `gfx1200` (RX 9060) + `gfx1201` (RX 9070), installer accepts both (fat-container target scan; a `gfx1250` metadata false positive is no longer mistaken for an image); bit-exact C32 work: e4m3 rasters chained between blocks, raster/window siblings read in place, workgroup fences replacing the barriers' implicit SE-scope L1 invalidation, dead decoder group-end rasters dropped | bench ~33 → **~25 ms**; in-game SHf **~28 fps**; bit-identical (16/16). `gfx1200` untested |
+| `0.2.6.1` | 09-22 | Deployment fix: the preload `.so` no longer carries a `DT_NEEDED` on `libamdhip64` — it is linked with the host linker and dlopens the ROCm runtime by absolute path after the process exists (`hip_load.c`), so LD_PRELOADing it no longer aborts Proton's `/usr/bin/env` and other Steam-spawned processes when a transitive dependency (e.g. `libfmt.so.12`) is missing; the wrapper exports `DLSS5_HIP_LIBRARY`/`DLSS5_HIP_DEP_DIRS` instead of polluting `LD_LIBRARY_PATH` (no more ROCm `libomp`/`libtbb`/`libunwind` shadowing). bit-exact C32: 7 intra-wave barriers dropped (11 → 4), keeping only the cross-wave ones | in-game SHf verified working; bench ~25 ms (−0.2 ms), bit-identical (16/16) |
 
 ## Troubleshooting and removal
 
