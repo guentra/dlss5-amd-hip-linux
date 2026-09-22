@@ -6,7 +6,16 @@
 namespace dlss5 {
 
 namespace {
-__device__ inline void c32_sync_window() { __syncthreads(); }
+// The kernel exchanges all inter-thread data through LDS; its global stores
+// are only consumed by later kernels (kernel-boundary fenced). A workgroup
+// release/acquire fence plus the split barrier is sufficient and lets the
+// compiler drop the SE-scope L1 invalidation a plain __syncthreads() forces
+// after every barrier (the weight L1 state survives).
+__device__ inline void c32_sync_window() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+}
 __device__ inline void c32_wave_sync() { __syncthreads(); }
 } // namespace
 
