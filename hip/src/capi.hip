@@ -148,9 +148,13 @@ static const char* set_err(const char* s) {
     return g_err.c_str();
 }
 
+extern "C" const char* dlss5_hip_runtime_error(void);
+
 extern "C" int dlss5_init(const char* weights_dir, int gpu) {
     std::lock_guard<std::mutex> lock(g_mu);
     try {
+        if (const char* why = dlss5_hip_runtime_error())
+            return set_err(why), -1;
         const char* dir = weights_dir && weights_dir[0] ? weights_dir : getenv("DLSS5_HIP_WEIGHTS");
         if (!dir || !dir[0])
             return set_err("no weights dir (DLSS5_HIP_WEIGHTS)"), -1;

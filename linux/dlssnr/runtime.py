@@ -74,8 +74,11 @@ def discover_roots(extra_roots=None, managed_root: Path | None = None) -> list[P
     if managed_root is not None:
         roots.append(Path(managed_root).expanduser())
     roots += sorted(Path('/opt').glob('rocm*'), reverse=True)
-    roots += [Path(p) for p in ('/usr/lib', '/usr/lib64', '/usr/local/lib', '/usr/local/lib64')]
+    roots += [Path(p) for p in (
+        '/usr/lib', '/usr/lib64', '/usr/local/lib', '/usr/local/lib64',
+        '/usr/lib/rocm', '/usr/lib64/rocm', '/usr/lib/x86_64-linux-gnu/rocm')]
     roots += sorted(Path('/usr/lib').glob('*-linux-gnu'))
+    roots += sorted(Path('/usr/lib64').glob('*-linux-gnu'))
     return list(dict.fromkeys(roots))
 
 

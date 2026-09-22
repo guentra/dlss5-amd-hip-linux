@@ -183,8 +183,23 @@ def wrapper_bytes(exe, *, magpie=False, gpu_name=None, hip=False, hip_so=None,
                     '  printf "DLSS5: HIP runtime missing or changed: %s; restore it or reinstall before launching.\\n" "$hip_library" >&2',
                     '  exit 1',
                     'fi',
-                    'export LD_LIBRARY_PATH=' + q(str(Path(library).parent)) + '"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
                 ]
+            # Private ROCm directories only. The loader opens libamdhip64 by
+            # absolute path and searches these plus the distro lib dirs for
+            # its dependencies. LD_LIBRARY_PATH is left alone so libomp, libtbb
+            # and libunwind from ROCm do not replace the system copies.
+            lines += [
+                'hip_dir=$(dirname "$hip_library")',
+                'hip_deps=""',
+                'for extra in "$hip_dir/rocm_sysdeps/lib" "$hip_dir/llvm/lib"; do',
+                '  if [[ -d "$extra" ]]; then hip_deps="${hip_deps:+$hip_deps:}$extra"; fi',
+                'done',
+                'export DLSS5_HIP_LIBRARY="$hip_library"',
+                'if [[ -n "$hip_deps" ]]; then',
+                '  export DLSS5_HIP_DEP_DIRS="$hip_deps"',
+                '  export STEAM_COMPAT_LIBRARY_PATHS="$hip_deps${STEAM_COMPAT_LIBRARY_PATHS:+:$STEAM_COMPAT_LIBRARY_PATHS}"',
+                'fi',
+            ]
         lines += [
             'export LD_PRELOAD="$so${LD_PRELOAD:+:$LD_PRELOAD}"',
             'export DLSS5_HIP=1',

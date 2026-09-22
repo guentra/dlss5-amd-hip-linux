@@ -129,8 +129,18 @@ $(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o $(BUILD)/ker
 hip-network70: $(BUILD)/bench.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o
 	$(HIPCC) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o $(BUILD)/gpu_interop.o
-	$(HIPCC) $(CXXFLAGS) -shared -fPIC $^ $(LDFLAGS) -o $@
+# Host link, not hipcc. hipcc would DT_NEEDED libamdhip64 and bake
+# -rpath /opt/rocm/lib. LD_PRELOAD then aborts unrelated processes
+# (Proton's /usr/bin/env) when a transitive dependency is missing.
+# src/hip_load.c dlopens the runtime instead.
+HOSTCC ?= gcc
+HOSTCXX ?= g++
+$(BUILD)/hip_load.o: src/hip_load.c Makefile
+	mkdir -p $(BUILD)
+	$(HOSTCC) -O2 -fPIC -c $< -o $@
+
+libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o $(BUILD)/gpu_interop.o $(BUILD)/hip_load.o
+	$(HOSTCXX) -shared -fPIC $(filter %.o,$^) -ldl -Wl,--allow-shlib-undefined -o $@
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h
 	@test -n "$(MINGW_CC)" || { printf '%s\n' 'x86_64-w64-mingw32-gcc not found. Set MINGW_CC= or MINGW_PREFIX= or install mingw-w64.'; exit 2; }
